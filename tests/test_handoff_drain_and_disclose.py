@@ -444,6 +444,7 @@ class RuleTextIsInEveryPlaceTests(unittest.TestCase):
         s4 = text[text.index("## 4. 拆节点"):text.index("## 5. 产出与提交")]
         line4 = next(line for line in s4.splitlines() if "两类边界（新增第三方依赖" in line)
         self.assertIn("跨平台交接", line4)
+        text = load_protocol("execution")
         s7 = text[text.index("## 7. 什么时候才能打断产品经理"):]
         line7 = next(line for line in s7.splitlines() if line.startswith("**已批准判据**"))
         self.assertIn("--platform-handoff", line7)

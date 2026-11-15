@@ -39,7 +39,7 @@ class AggregateDigestRegistrationTests(unittest.TestCase):
 class Ir1DocContractKeptTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.prd = (ROOT / "vibe_guide" / "protocols" / "prd-guide.md").read_text(encoding="utf-8")
+        cls.prd = (ROOT / "vibe_guide" / "protocols" / "execution.md").read_text(encoding="utf-8")
         cls.card = (ROOT / "vibe_guide" / "protocols" / "supervisor-card.md").read_text(encoding="utf-8")
 
     def test_locate_and_worktree_missing_docs_survived_aggregation(self):

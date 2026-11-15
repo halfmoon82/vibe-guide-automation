@@ -81,7 +81,7 @@ class AnsweredDecisionWakeTests(unittest.TestCase):
         self.assertIn('下一次心跳自动接上', outcome.payload['resume_hint'])
 
     def test_protocol_section_describes_auto_consumption(self):
-        text = (Path(__file__).resolve().parents[1] / 'vibe_guide/protocols/prd-guide.md').read_text(encoding='utf-8')
+        text = (Path(__file__).resolve().parents[1] / 'vibe_guide/protocols/execution.md').read_text(encoding='utf-8')
         self.assertIn('由运行自动消费', text)
         self.assertNotIn('用户回复后先 `vibe supervisor-hold', text)
 

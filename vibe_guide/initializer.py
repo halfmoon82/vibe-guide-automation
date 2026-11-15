@@ -24,6 +24,8 @@ from .scanner import (
     scan_project,
 )
 from .protocols import (
+    EXECUTION_NAME,
+    EXECUTION_PROPOSAL_RELATIVE,
     PRD_GUIDE_NAME,
     PRD_GUIDE_PROPOSAL_RELATIVE,
     VIBE_ENTRY_NAME,
@@ -203,6 +205,7 @@ def _atomic_write_text(path, text):
 PROTOCOL_COPIES = (
     (PRD_GUIDE_PROPOSAL_RELATIVE, PRD_GUIDE_NAME),
     (VIBE_ENTRY_PROPOSAL_RELATIVE, VIBE_ENTRY_NAME),
+    (EXECUTION_PROPOSAL_RELATIVE, EXECUTION_NAME),
 )
 
 

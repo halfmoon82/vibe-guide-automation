@@ -17,6 +17,7 @@ from unittest import mock
 from vibe_guide import protocols
 from vibe_guide.cli import run_cli
 from vibe_guide.protocols import (
+    EXECUTION_PROPOSAL_RELATIVE,
     PRD_GUIDE_PROPOSAL_RELATIVE,
     SHIPPED_PROTOCOL_DIGESTS,
     VIBE_ENTRY_PROPOSAL_RELATIVE,
@@ -29,6 +30,7 @@ OLD_DIGEST = hashlib.sha256(OLD_TEXT.encode("utf-8")).hexdigest()
 COPIES = (
     ("prd-guide", PRD_GUIDE_PROPOSAL_RELATIVE),
     ("vibe-entry", VIBE_ENTRY_PROPOSAL_RELATIVE),
+    ("execution", EXECUTION_PROPOSAL_RELATIVE),
 )
 
 
@@ -180,6 +182,75 @@ class CommandRefreshTests(_Case):
         self.addCleanup(shutil.rmtree, bare, True)
         run_cli(["resume"], bare)
         self.assertEqual(list(bare.iterdir()), [])
+
+
+class ExecutionProtocolSplitTests(unittest.TestCase):
+    """P1a: planning and execution protocols are decoupled (design A5/A12).
+
+    prd-guide ends at the planning boundary (§5) and every supervision rule
+    moved verbatim into execution.md under its old section number, so all
+    §6.x/§7 cross-references kept by code and docs still resolve.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.prd = load_protocol("prd-guide")
+        cls.execution = load_protocol("execution")
+
+    def test_prd_guide_carries_no_supervision_section(self):
+        for heading in ("## 6. 监工", "## 7. 什么时候才能打断产品经理"):
+            self.assertNotIn(heading, self.prd, heading)
+
+    def test_prd_guide_routes_supervisors_to_the_execution_protocol(self):
+        self.assertIn("execution.md", self.prd)
+        self.assertIn(EXECUTION_PROPOSAL_RELATIVE, self.prd)
+
+    def test_execution_protocol_owns_the_supervision_sections(self):
+        for heading in (
+            "## 6. 监工",
+            "### 6.0 形态与开工",
+            "### 6.1 三级自愈与升级",
+            "### 6.2 信箱回写",
+            "### 6.3 派发合同",
+            "### 6.4 平台差异",
+            "### 6.5 换班、预检分支与其他",
+            "## 7. 什么时候才能打断产品经理",
+        ):
+            self.assertIn(heading, self.execution, heading)
+
+    def test_execution_protocol_does_not_refer_back_to_prd_guide(self):
+        """The split is one-way: an execution session must never be told to
+        re-read the planning protocol for execution rules."""
+        for needle in ("prd-guide", "PRD 引导协议", "SKILL.md` 的协议引导"):
+            self.assertNotIn(needle, self.execution, needle)
+
+    def test_init_materializes_the_execution_copy(self):
+        root = Path(tempfile.mkdtemp(prefix="vibe-execution-init-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        result = run_cli(["init", "--confirm", "--json"], root)
+        self.assertEqual(result.payload.get("status"), "ok", result.payload)
+        copy = root / EXECUTION_PROPOSAL_RELATIVE
+        self.assertTrue(copy.is_file())
+        self.assertEqual(copy.read_text(encoding="utf-8"), self.execution)
+        self.assertIn(EXECUTION_PROPOSAL_RELATIVE, result.payload.get("paths", []))
+
+    def test_edited_execution_copy_is_not_touched(self):
+        """A12: a locally edited execution protocol is never overwritten and
+        the drift is surfaced as a note."""
+        root = Path(tempfile.mkdtemp(prefix="vibe-execution-edited-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        self.assertEqual(
+            run_cli(["init", "--confirm", "--json"], root).payload.get("status"), "ok"
+        )
+        copy = root / EXECUTION_PROPOSAL_RELATIVE
+        edited = load_protocol("execution") + "\n本地补充\n"
+        copy.write_text(edited, encoding="utf-8")
+        result = run_cli(["init", "--confirm", "--json"], root)
+        self.assertEqual(copy.read_text(encoding="utf-8"), edited)
+        self.assertTrue(
+            any(EXECUTION_PROPOSAL_RELATIVE in note for note in result.payload.get("notes", [])),
+            result.payload,
+        )
 
 
 if __name__ == "__main__":

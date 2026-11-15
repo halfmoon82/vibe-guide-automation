@@ -553,7 +553,7 @@ class ACB6RecoveryActionTests(_ProjectCase):
 
         Facts are anchored to the line that owns them, not the whole section.
         """
-        text = (PROTOCOLS / "prd-guide.md").read_text(encoding="utf-8")
+        text = (PROTOCOLS / "execution.md").read_text(encoding="utf-8")
         section = text.split("## 7.", 1)[1].split("\n## ", 1)[0]
         lines = section.splitlines()
         for action in ("repair_node", "requeue_same_task", "reconcile_binding",

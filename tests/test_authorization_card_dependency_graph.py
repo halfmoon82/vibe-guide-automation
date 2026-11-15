@@ -288,7 +288,7 @@ class HeartbeatSelectedTierTests(unittest.TestCase):
         self.assertFalse(long_tier["selected"])
         # Same wording as prd-guide 6.0: unverified push wake-up means 10 minutes.
         self.assertIn("推送唤醒未验证的平台默认 10 分钟", long_tier["reason"])
-        guide = (Path(__file__).resolve().parents[1] / "vibe_guide/protocols/prd-guide.md").read_text("utf-8")
+        guide = (Path(__file__).resolve().parents[1] / "vibe_guide/protocols/execution.md").read_text("utf-8")
         self.assertIn("推送唤醒未验证的平台 10 分钟", guide)
 
         directory = self.paths.vibe / "plans" / "p1"

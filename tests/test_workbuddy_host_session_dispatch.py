@@ -521,7 +521,7 @@ class WorktreePinningOnWorkBuddyTests(unittest.TestCase):
     def test_prd_guide_states_the_workbuddy_worktree_rule(self):
         from vibe_guide.protocols import load_protocol
 
-        text = load_protocol("prd-guide")
+        text = load_protocol("execution")
         section = text[text.index("### 6.3"):text.index("**环境事实**")]
         for token in ("WorkBuddy", "没有 `cwd` 参数", "每条命令先 `cd <worktree>`", "主项目",
                       "串行节点也一样", "`vibe worker-deliver` 必须指向**主项目目录**"):

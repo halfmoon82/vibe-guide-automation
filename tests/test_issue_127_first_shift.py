@@ -28,7 +28,7 @@ class PrdGuideOpeningStepTests(unittest.TestCase):
     """§6 must open with the two duties, before it serves the mailbox."""
 
     def section_and_opening(self):
-        text = load_protocol("prd-guide")
+        text = load_protocol("execution")
         start = text.index("## 6. 监工")
         section = text[start:text.index("\n## 7. ", start)]
         opening_start = section.index("### 6.0")

@@ -63,7 +63,7 @@ class EvidenceWordingTests(unittest.TestCase):
     def test_dag_contract_and_prd_guide_use_the_same_sentence(self):
         """D3: the contract must not read as evidence.claim.{...}."""
         guide = (Path(__file__).resolve().parents[1]
-                 / "vibe_guide" / "protocols" / "prd-guide.md").read_text(encoding="utf-8")
+                 / "vibe_guide" / "protocols" / "execution.md").read_text(encoding="utf-8")
         output = self._contract_output()
         self.assertIn(self.SENTENCE, output)
         self.assertIn(self.SENTENCE, guide)

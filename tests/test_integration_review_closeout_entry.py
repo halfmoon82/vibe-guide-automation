@@ -246,7 +246,7 @@ class ProtocolDocumentsTheClaimTests(unittest.TestCase):
     SECTION_HEADING = "#### 整合审查节点的 accepted"
 
     def section(self):
-        text = load_protocol("prd-guide")
+        text = load_protocol("execution")
         self.assertIn(self.SECTION_HEADING, text)
         return text.split(self.SECTION_HEADING, 1)[1].split("\n#", 1)[0]
 

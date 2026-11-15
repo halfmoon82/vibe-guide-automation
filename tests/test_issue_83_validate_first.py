@@ -319,13 +319,13 @@ class ProducerToldTheSchemaTests(unittest.TestCase):
         self.assertIn("重报", text)
 
     def test_prd_guide_documents_the_observation_severities(self):
-        text = load_protocol("prd-guide")
+        text = load_protocol("execution")
         section = text.split("#### 整合审查节点的 accepted", 1)[1]
         self.assertIn("p3", section)
         self.assertIn("p4", section)
 
     def test_prd_guide_no_longer_says_format_errors_brick_the_node(self):
-        text = load_protocol("prd-guide")
+        text = load_protocol("execution")
         section = text.split("#### 整合审查节点的 accepted", 1)[1]
         self.assertIn("acceptance_rejected", section)
 

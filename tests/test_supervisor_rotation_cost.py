@@ -629,7 +629,7 @@ class DocumentationExampleTests(unittest.TestCase):
     def test_shipped_hold_examples_require_category_but_release_does_not(self):
         root = Path(__file__).resolve().parents[1]
         readme = (root / "README.md").read_text(encoding="utf-8")
-        prd_guide = (root / "vibe_guide" / "protocols" / "prd-guide.md").read_text(
+        prd_guide = (root / "vibe_guide" / "protocols" / "execution.md").read_text(
             encoding="utf-8"
         )
 

@@ -114,7 +114,7 @@ class UnresolvedNativeToolTests(unittest.TestCase):
 class ProtocolRuleTests(unittest.TestCase):
     def _lines(self):
         from vibe_guide import protocols
-        return (Path(protocols.__file__).parent / "prd-guide.md").read_text().splitlines()
+        return (Path(protocols.__file__).parent / "execution.md").read_text().splitlines()
 
     # 旧「信箱」章节（complete()/UnresolvedNativeTool/attempts 的细节）已随监工手册删除，
     # 规则本身保留为 §6.0 的一行：不是节点故障、重试一次后停下、不交班。

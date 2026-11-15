@@ -12,6 +12,7 @@ from vibe_guide.protocols import SHIPPED_PROTOCOL_DIGESTS
 
 ROOT = Path(__file__).resolve().parent.parent
 PRD_GUIDE = ROOT / "vibe_guide" / "protocols" / "prd-guide.md"
+EXECUTION = ROOT / "vibe_guide" / "protocols" / "execution.md"
 SECRET_RE = re.compile(r"sk-[A-Za-z0-9-]{8,}")
 
 
@@ -51,9 +52,11 @@ def _readme_section(path, heading):
 
 
 class PrdGuideBackgroundTests(unittest.TestCase):
+    """P1a: §6.4 平台差异随监工章节整体迁入执行协议，本类钉住其形状。"""
+
     @classmethod
     def setUpClass(cls):
-        cls.text = PRD_GUIDE.read_text(encoding="utf-8")
+        cls.text = EXECUTION.read_text(encoding="utf-8")
         cls.s64 = _section_64(cls.text)
 
     def test_table_has_background_column(self):
@@ -103,8 +106,8 @@ class PrdGuideBackgroundTests(unittest.TestCase):
         self.assertNotIn("ANTHROPIC_API_KEY=", self.s64)
 
     def test_digest_registered(self):
-        digest = hashlib.sha256(PRD_GUIDE.read_bytes()).hexdigest()
-        self.assertIn(digest, SHIPPED_PROTOCOL_DIGESTS["prd-guide"])
+        digest = hashlib.sha256(EXECUTION.read_bytes()).hexdigest()
+        self.assertIn(digest, SHIPPED_PROTOCOL_DIGESTS["execution"])
 
 
 class PrdGuideWriteScopeRuleTests(unittest.TestCase):
@@ -154,7 +157,7 @@ class ReadingMapTests(unittest.TestCase):
         self.assertLess(self.text.index("## 阅读地图"), self.text.index("## 0. "))
 
     def test_map_names_each_audience(self):
-        for needle in ("PRD 引导", "监工", "§6.4", "整合审查", "§7"):
+        for needle in ("PRD 引导", "监工", "整合审查", "授权"):
             self.assertIn(needle, self.map_, needle)
 
     def test_every_section_reference_resolves_to_a_heading(self):

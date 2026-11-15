@@ -122,7 +122,7 @@ class SingleShiftTests(unittest.TestCase):
         self.assertTrue(result.payload['single_shift'])
 
     def test_protocol_documents_switch_and_keeps_rotate_branch(self):
-        text = load_protocol('prd-guide')
+        text = load_protocol('execution')
         self.assertIn('"supervisor_single_shift": false', text)
         self.assertIn('输出 `rotate`', text)
 
