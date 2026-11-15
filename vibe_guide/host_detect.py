@@ -146,3 +146,109 @@ def resolve_adapter(explicit: Optional[str], detection: HostDetection, flag: str
 
 def adapter_required_message(detection: HostDetection, flag: str = "--adapter") -> str:
     return "无法从环境识别当前平台：{}；请用 {} 指明本会话所属平台".format(detection.describe(), flag)
+
+
+# ---------------------------------------------------------------------------
+# P2b: how far the entry protocol really reaches each frozen provider.
+# ---------------------------------------------------------------------------
+import json
+from pathlib import Path
+
+ENTRY_PROVIDERS = ("codex", "claude-code", "workbuddy")
+ENTRY_LEVELS = ("protocol", "rules", "hook", "trigger", "coverage")
+ENTRY_SCENES = ("new_session", "followup", "resume", "delegation")
+_ENTRY_PROTOCOL = Path(".vibe/proposals/skills/vibe-entry/SKILL.md")
+_ENTRY_RULE_MARKER = "New Session Entry"
+_ENTRY_HOOK_TAG = "vibe-entry"
+#: Claude Code's public hook events -> the scenes each one fires before.
+#: SessionStart also fires on resume, but whether it carried the entry text on
+#: a resumed session is not recorded anywhere, so resume stays uncovered.
+_CLAUDE_HOOK_SCENES = {
+    "SessionStart": ("new_session",),
+    "UserPromptSubmit": ("new_session", "followup"),
+    "SubagentStart": ("delegation",),
+}
+
+
+def _claude_hook_scan(root, home):
+    """(state, scenes) from Claude Code settings files; read-only."""
+    scenes, readable_any, broken = set(), False, False
+    for base in (Path(home) / ".claude", Path(root) / ".claude"):
+        for name in ("settings.json", "settings.local.json"):
+            path = base / name
+            if not path.is_file():
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                hooks = data.get("hooks") or {}
+                readable_any = True
+                for event, entries in hooks.items():
+                    for entry in entries or []:
+                        for hook in entry.get("hooks") or []:
+                            if _ENTRY_HOOK_TAG in str(hook.get("command") or ""):
+                                scenes.update(_CLAUDE_HOOK_SCENES.get(event, ()))
+                                scenes.add("_registered")
+            except (OSError, ValueError, AttributeError, TypeError):
+                broken = True
+    if "_registered" in scenes:
+        scenes.discard("_registered")
+        return "registered", sorted(scenes, key=ENTRY_SCENES.index) if scenes else []
+    return ("unknown" if broken else "absent"), []
+
+
+def _rules_state(root, provider):
+    from . import scanner
+    rules_name = {"codex": "AGENTS.md", "claude-code": "AGENTS.md", "workbuddy": "CODEBUDDY.md"}[provider]
+    path = Path(root) / rules_name
+    try:
+        if path.is_symlink() or not path.is_file():
+            return "absent"
+        if _ENTRY_RULE_MARKER not in path.read_text(encoding="utf-8"):
+            return "absent"
+    except (OSError, UnicodeDecodeError):
+        return "unknown"
+    if provider == "claude-code" and not scanner.claude_entry_reaches_rules(root, rules_name):
+        return "not_loaded"
+    return "adopted"
+
+
+def entry_wiring(root, home):
+    """Per-provider entry reach, as five independent levels.
+
+    protocol  -- the vibe-entry protocol file exists in the project
+    rules     -- the rules file carrying it is one the host actually loads
+    hook      -- a public per-request hook is registered (``unverified`` when
+                 the host has no public hook evidence, ``unknown`` when its
+                 settings cannot be read)
+    trigger   -- real first/follow-up inputs were observed running it; nothing
+                 records that yet, so it stays ``unknown`` rather than green
+    coverage  -- which of new session / follow-up / resume / delegation the
+                 registered hooks reach
+
+    No level implies another: a generated rules file alone, or SessionStart
+    alone, never reads as a pass.  Read-only; writes nothing.
+    """
+    protocol = "present" if (Path(root) / _ENTRY_PROTOCOL).is_file() else "absent"
+    rows = []
+    for provider in ENTRY_PROVIDERS:
+        if provider == "claude-code":
+            hook, scenes = _claude_hook_scan(root, home)
+            mode = "hook" if hook == "registered" else ("unknown" if hook == "unknown" else "rules_guidance")
+        else:
+            hook, scenes, mode = "unverified", [], "rules_guidance"
+        coverage = "none" if not scenes else ("full" if len(scenes) == len(ENTRY_SCENES) else "partial")
+        levels = {
+            "protocol": protocol,
+            "rules": _rules_state(root, provider),
+            "hook": hook,
+            "trigger": "unknown",
+            "coverage": coverage,
+        }
+        rows.append({
+            "provider": provider,
+            "mode": mode,
+            "levels": levels,
+            "coverage": scenes,
+            "strong": levels["trigger"] == "observed" and coverage == "full",
+        })
+    return rows
