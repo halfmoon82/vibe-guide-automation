@@ -2419,7 +2419,7 @@ SUPERVISOR_SUMMARY_RULES = (
     "接班会话与上一班模型或思考档位不同，supervisor-register 只警告不阻断；同一运行请保持同模型同档位。",
 )
 #: Where the mailbox result shapes are defined (rendered from MAILBOX_FIELD_TABLE).
-MAILBOX_FIELD_TABLE_REF = "prd-guide §6.2（同源 runners.provider_action.MAILBOX_FIELD_TABLE）"
+MAILBOX_FIELD_TABLE_REF = "execution §6.2（同源 runners.provider_action.MAILBOX_FIELD_TABLE）"
 #: Ways out of a stuck node that exist as commands today.
 SUPERVISOR_KNOWN_EXITS = (
     ("worker 提问或交付被拒", "requeue --plan <计划> --run-id <运行> --node <节点> --note '<答复>'，再 resume"),
@@ -2886,7 +2886,7 @@ def _template_payload(operation, role, provider=None):
     """A result example for ``operation`` that passes ``validate_result_shape``.
 
     Read from ``MAILBOX_FIELD_TABLE``, the same table the write-time check, its
-    error hint and the prd-guide §6.2 table use.  Placeholder strings stand
+    error hint and the execution §6.2 table use.  Placeholder strings stand
     where the supervisor must put real values; the check refuses a result that
     keeps one, because a stored result cannot be rewritten.
     """

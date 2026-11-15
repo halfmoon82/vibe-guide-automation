@@ -260,7 +260,7 @@ def _placeholder_paths(value, path=""):
 
 
 #: The one table the mailbox template, the write-time check, the error hint and
-#: the ``prd-guide`` §6.2 table all read: operation x role x branch -> the
+#: the ``execution`` §6.2 table all read: operation x role x branch -> the
 #: example result.  ``role`` is ``None`` when the shape does not depend on it.
 #: Every ``PLACEHOLDER`` stands where the supervisor must put a real value; a
 #: result that keeps one is refused.  Changing a row changes all four at once
@@ -311,14 +311,14 @@ def mailbox_example(operation, role=None, branch="ok"):
     return json.loads(json.dumps(row[3], ensure_ascii=False))
 
 
-#: Markers around the generated table in ``prd-guide.md`` §6.2.
+#: Markers around the generated table in ``execution.md`` §6.2.
 DOC_TABLE_BEGIN = "<!-- mailbox-table:begin -->"
 DOC_TABLE_END = "<!-- mailbox-table:end -->"
 _BRANCH_LABEL = {"ok": "", "failed": "（失败）", "pending": "（未完）", "complete": "（完）"}
 
 
 def render_doc_table():
-    """The prd-guide §6.2 table, generated from ``MAILBOX_FIELD_TABLE``."""
+    """The execution §6.2 table, generated from ``MAILBOX_FIELD_TABLE``."""
     lines = ["| 操作 | 角色 | payload | 说明 |", "|---|---|---|---|"]
     for operation, role, branch, example, note in MAILBOX_FIELD_TABLE:
         lines.append("| `{}`{} | {} | `{}` | {} |".format(

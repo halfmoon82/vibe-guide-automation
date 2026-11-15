@@ -239,3 +239,26 @@ class ReadmeBackgroundTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NoStaleExecutionPointerTests(unittest.TestCase):
+    """P1a: §6/§7 live in execution.md; shipped protocol text and the runtime
+    constants must not send a reader to prd-guide for them."""
+
+    STALE = re.compile(r"prd-guide(?:\.md)?[`\s]*§\s*[67]")
+
+    def test_shipped_protocols_have_no_stale_pointer(self):
+        for path in sorted((ROOT / "vibe_guide" / "protocols").glob("*.md")):
+            if path.name == "prd-guide.md":
+                continue
+            text = path.read_text(encoding="utf-8")
+            self.assertIsNone(self.STALE.search(text), path.name)
+
+    def test_runtime_sources_have_no_stale_pointer(self):
+        for rel in ("supervisor.py", "runners/provider_action.py", "monitor.py"):
+            text = (ROOT / "vibe_guide" / rel).read_text(encoding="utf-8")
+            self.assertIsNone(self.STALE.search(text), rel)
+
+    def test_mailbox_ref_points_to_execution(self):
+        from vibe_guide.supervisor import MAILBOX_FIELD_TABLE_REF
+        self.assertIn("execution §6.2", MAILBOX_FIELD_TABLE_REF)
