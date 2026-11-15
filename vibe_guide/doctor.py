@@ -38,6 +38,15 @@ def _host_rules_facts(report):
         return {'decision': 'unknown', 'files': {}, 'reason': error.__class__.__name__}
 
 
+def _entry_wiring_facts(report):
+    """Entry-wiring facts; best-effort like the host-rule facts."""
+    from .host_detect import entry_wiring
+    try:
+        return entry_wiring(Path(report.root), Path.home())
+    except Exception as error:  # noqa: BLE001 - diagnostics stay best-effort
+        return [{'provider': 'unknown', 'reason': error.__class__.__name__}]
+
+
 def _site_packages_paths():
     """Installed locations of the running interpreter, as sysconfig knows them."""
     try:
@@ -210,6 +219,8 @@ def doctor(report):
         },
         'agents': {'available': available_agents},
         'host_rules': _host_rules_facts(report),
+        # Advisory: five separate levels per provider; never part of readiness.
+        'entry_wiring': _entry_wiring_facts(report),
         # Advisory only: whether a version assertion run from here would prove
         # anything about the installed release (#257).
         'install': install_source_facts(),

@@ -302,3 +302,88 @@ class EntryReadsTheProcessEnvironmentTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EntryWiringTests(unittest.TestCase):
+    """P2b: five separate levels per provider; none implies another."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.home = self.tmp / "home"
+        self.root = self.tmp / "proj"
+        (self.home / ".claude").mkdir(parents=True)
+        self.root.mkdir()
+
+    def _hooks(self, events, home=True):
+        base = (self.home if home else self.root) / ".claude"
+        base.mkdir(parents=True, exist_ok=True)
+        data = {"hooks": {name: [{"hooks": [{"type": "command", "command": cmd}]}]
+                          for name, cmd in events.items()}}
+        (base / "settings.json").write_text(json.dumps(data), encoding="utf-8")
+
+    def _rows(self):
+        from vibe_guide.host_detect import entry_wiring
+        return {row["provider"]: row for row in entry_wiring(self.root, self.home)}
+
+    def test_reports_the_three_frozen_providers_with_five_levels(self):
+        rows = self._rows()
+        self.assertEqual(set(rows), {"codex", "claude-code", "workbuddy"})
+        for row in rows.values():
+            self.assertEqual(
+                [name for name in row["levels"]],
+                ["protocol", "rules", "hook", "trigger", "coverage"])
+
+    def test_session_start_alone_is_not_a_pass(self):
+        self._hooks({"SessionStart": "bash $HOME/.claude/hooks/vibe-entry-inject.sh"})
+        row = self._rows()["claude-code"]
+        self.assertEqual(row["levels"]["hook"], "registered")
+        self.assertEqual(row["coverage"], ["new_session"])
+        self.assertEqual(row["levels"]["coverage"], "partial")
+        self.assertFalse(row["strong"])
+
+    def test_per_request_hook_covers_followup_but_still_needs_a_real_trigger(self):
+        self._hooks({
+            "SessionStart": "bash vibe-entry-inject.sh",
+            "UserPromptSubmit": "bash vibe-entry-inject.sh",
+            "PreToolUse": "python3 vibe-entry-gate.py",
+        })
+        row = self._rows()["claude-code"]
+        self.assertIn("followup", row["coverage"])
+        self.assertEqual(row["levels"]["trigger"], "unknown")  # no real-input record
+        self.assertFalse(row["strong"])
+
+    def test_unrelated_hooks_do_not_count(self):
+        self._hooks({"UserPromptSubmit": "python3 other-tool.py"})
+        self.assertEqual(self._rows()["claude-code"]["levels"]["hook"], "absent")
+
+    def test_unreadable_settings_is_unknown_not_absent(self):
+        (self.home / ".claude" / "settings.json").write_text("{not json", encoding="utf-8")
+        self.assertEqual(self._rows()["claude-code"]["levels"]["hook"], "unknown")
+
+    def test_providers_without_public_hook_evidence_stay_unverified(self):
+        rows = self._rows()
+        for name in ("codex", "workbuddy"):
+            self.assertEqual(rows[name]["levels"]["hook"], "unverified")
+            self.assertEqual(rows[name]["mode"], "rules_guidance")
+            self.assertFalse(rows[name]["strong"])
+
+    def test_generated_rules_file_alone_is_rules_level_only(self):
+        (self.root / "AGENTS.md").write_text("## New Session Entry\n", encoding="utf-8")
+        rows = self._rows()
+        self.assertEqual(rows["codex"]["levels"]["rules"], "adopted")
+        self.assertEqual(rows["codex"]["levels"]["trigger"], "unknown")
+        self.assertEqual(rows["claude-code"]["levels"]["rules"], "not_loaded")  # no @import
+
+    def test_probe_writes_nothing(self):
+        before = sorted(p.relative_to(self.tmp) for p in self.tmp.rglob("*"))
+        self._rows()
+        self.assertEqual(before, sorted(p.relative_to(self.tmp) for p in self.tmp.rglob("*")))
+
+    def test_doctor_facts_carry_entry_wiring_without_changing_readiness(self):
+        from vibe_guide.doctor import doctor
+        from vibe_guide.scanner import scan_project
+        report = doctor(scan_project(ProjectPaths(self.root)))
+        self.assertIn("entry_wiring", report.facts)
+        self.assertEqual({r["provider"] for r in report.facts["entry_wiring"]},
+                         {"codex", "claude-code", "workbuddy"})
