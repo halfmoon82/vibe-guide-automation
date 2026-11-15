@@ -1,0 +1,317 @@
+{
+  "report_id": "v6-p3-binding-report/1",
+  "node": "v6-p3-migration",
+  "generated_on": "2026-11-15",
+  "matrix_id": "v6-support-matrix/1",
+  "release_status": "blocked_pending_scope",
+  "release_status_label": "未验收",
+  "complete_release_claimed": false,
+  "failed_combinations_retained": true,
+  "combinations": [
+    {
+      "id": "install.wheel-py39.fresh_install",
+      "status": "未验收",
+      "evidence": null,
+      "usage": "unknown",
+      "unverified_reason": "需真机/真实 provider/真实用量证据；本节点为文档与夹具收口，不执行真实安装、模型下载、Ollama 安装、系统配置或发布（PRD 非目标与约束）。"
+    },
+    {
+      "id": "install.wheel-py39.V5.2.7_to_V6.0",
+      "status": "未验收",
+      "evidence": null,
+      "usage": "unknown",
+      "unverified_reason": "需真机/真实 provider/真实用量证据；本节点为文档与夹具收口，不执行真实安装、模型下载、Ollama 安装、系统配置或发布（PRD 非目标与约束）。"
+    },
+    {
+      "id": "install.wheel-py39.V5.2.8_to_V6.0",
+      "status": "未验收",
+      "evidence": null,
+      "usage": "unknown",
+      "unverified_reason": "需真机/真实 provider/真实用量证据；本节点为文档与夹具收口，不执行真实安装、模型下载、Ollama 安装、系统配置或发布（PRD 非目标与约束）。"
+    },
+    {
+      "id": "install.wheel-py312.fresh_install",
+      "status": "未验收",
+      "evidence": null,
+      "usage": "unknown",
+      "unverified_reason": "需真机/真实 provider/真实用量证据；本节点为文档与夹具收口，不执行真实安装、模型下载、Ollama 安装、系统配置或发布（PRD 非目标与约束）。"
+    },
+    {
+      "id": "install.wheel-py312.V5.2.7_to_V6.0",
+      "status": "未验收",
+      "evidence": null,
+      "usage": "unknown",
+      "unverified_reason": "需真机/真实 provider/真实用量证据；本节点为文档与夹具收口，不执行真实安装、模型下载、Ollama 安装、系统配置或发布（PRD 非目标与约束）。"
+    },
+    {
+      "id": "install.wheel-py312.V5.2.8_to_V6.0",
+      "status": "未验收",
+      "evidence": null,
+      "usage": "unknown",
+      "unverified_reason": "需真机/真实 provider/真实用量证据；本节点为文档与夹具收口，不执行真实安装、模型下载、Ollama 安装、系统配置或发布（PRD 非目标与约束）。"
+    },
+    {
+      "id": "install.sdist-py312.fresh_install",
+      "status": "未验收",
+      "evidence": null,
+      "usage": "unknown",
+      "unverified_reason": "需真机/真实 provider/真实用量证据；本节点为文档与夹具收口，不执行真实安装、模型下载、Ollama 安装、系统配置或发布（PRD 非目标与约束）。"
+    },
+    {
+      "id": "install.sdist-py312.V5.2.7_to_V6.0",
+      "status": "未验收",
+      "evidence": null,
+      "usage": "unknown",
+      "unverified_reason": "需真机/真实 provider/真实用量证据；本节点为文档与夹具收口，不执行真实安装、模型下载、Ollama 安装、系统配置或发布（PRD 非目标与约束）。"
+    },
+    {
+      "id": "install.sdist-py312.V5.2.8_to_V6.0",
+      "status": "未验收",
+      "evidence": null,
+      "usage": "unknown",
+      "unverified_reason": "需真机/真实 provider/真实用量证据；本节点为文档与夹具收口，不执行真实安装、模型下载、Ollama 安装、系统配置或发布（PRD 非目标与约束）。"
+    },
+    {
+      "id": "install.source-py312.fresh_install",
+      "status": "未验收",
+      "evidence": null,
+      "usage": "unknown",
+      "unverified_reason": "需真机/真实 provider/真实用量证据；本节点为文档与夹具收口，不执行真实安装、模型下载、Ollama 安装、系统配置或发布（PRD 非目标与约束）。"
+    },
+    {
+      "id": "install.source-py312.V5.2.7_to_V6.0",
+      "status": "未验收",
+      "evidence": null,
+      "usage": "unknown",
+      "unverified_reason": "需真机/真实 provider/真实用量证据；本节点为文档与夹具收口，不执行真实安装、模型下载、Ollama 安装、系统配置或发布（PRD 非目标与约束）。"
+    },
+    {
+      "id": "install.source-py312.V5.2.8_to_V6.0",
+      "status": "未验收",
+      "evidence": null,
+      "usage": "unknown",
+      "unverified_reason": "需真机/真实 provider/真实用量证据；本节点为文档与夹具收口，不执行真实安装、模型下载、Ollama 安装、系统配置或发布（PRD 非目标与约束）。"
+    },
+    {
+      "id": "entry.codex.new_session",
+      "status": "未验收",
+      "evidence": null,
+      "usage": "unknown",
+      "unverified_reason": "需真机/真实 provider/真实用量证据；本节点为文档与夹具收口，不执行真实安装、模型下载、Ollama 安装、系统配置或发布（PRD 非目标与约束）。"
+    },
+    {
+      "id": "entry.codex.followup_new_goal",
+      "status": "未验收",
+      "evidence": null,
+      "usage": "unknown",
+      "unverified_reason": "需真机/真实 provider/真实用量证据；本节点为文档与夹具收口，不执行真实安装、模型下载、Ollama 安装、系统配置或发布（PRD 非目标与约束）。"
+    },
+    {
+      "id": "entry.codex.resume",
+      "status": "未验收",
+      "evidence": null,
+      "usage": "unknown",
+      "unverified_reason": "需真机/真实 provider/真实用量证据；本节点为文档与夹具收口，不执行真实安装、模型下载、Ollama 安装、系统配置或发布（PRD 非目标与约束）。"
+    },
+    {
+      "id": "entry.codex.delegate",
+      "status": "未验收",
+      "evidence": null,
+      "usage": "unknown",
+      "unverified_reason": "需真机/真实 provider/真实用量证据；本节点为文档与夹具收口，不执行真实安装、模型下载、Ollama 安装、系统配置或发布（PRD 非目标与约束）。"
+    },
+    {
+      "id": "entry.codex.auth_lifecycle_fastpath",
+      "status": "未验收",
+      "evidence": null,
+      "usage": "unknown",
+      "unverified_reason": "需真机/真实 provider/真实用量证据；本节点为文档与夹具收口，不执行真实安装、模型下载、Ollama 安装、系统配置或发布（PRD 非目标与约束）。"
+    },
+    {
+      "id": "entry.claude_code.new_session",
+      "status": "未验收",
+      "evidence": null,
+      "usage": "unknown",
+      "unverified_reason": "需真机/真实 provider/真实用量证据；本节点为文档与夹具收口，不执行真实安装、模型下载、Ollama 安装、系统配置或发布（PRD 非目标与约束）。"
+    },
+    {
+      "id": "entry.claude_code.followup_new_goal",
+      "status": "未验收",
+      "evidence": null,
+      "usage": "unknown",
+      "unverified_reason": "需真机/真实 provider/真实用量证据；本节点为文档与夹具收口，不执行真实安装、模型下载、Ollama 安装、系统配置或发布（PRD 非目标与约束）。"
+    },
+    {
+      "id": "entry.claude_code.resume",
+      "status": "未验收",
+      "evidence": null,
+      "usage": "unknown",
+      "unverified_reason": "需真机/真实 provider/真实用量证据；本节点为文档与夹具收口，不执行真实安装、模型下载、Ollama 安装、系统配置或发布（PRD 非目标与约束）。"
+    },
+    {
+      "id": "entry.claude_code.delegate",
+      "status": "未验收",
+      "evidence": null,
+      "usage": "unknown",
+      "unverified_reason": "需真机/真实 provider/真实用量证据；本节点为文档与夹具收口，不执行真实安装、模型下载、Ollama 安装、系统配置或发布（PRD 非目标与约束）。"
+    },
+    {
+      "id": "entry.claude_code.auth_lifecycle_fastpath",
+      "status": "未验收",
+      "evidence": null,
+      "usage": "unknown",
+      "unverified_reason": "需真机/真实 provider/真实用量证据；本节点为文档与夹具收口，不执行真实安装、模型下载、Ollama 安装、系统配置或发布（PRD 非目标与约束）。"
+    },
+    {
+      "id": "entry.workbuddy.new_session",
+      "status": "未验收",
+      "evidence": null,
+      "usage": "unknown",
+      "unverified_reason": "需真机/真实 provider/真实用量证据；本节点为文档与夹具收口，不执行真实安装、模型下载、Ollama 安装、系统配置或发布（PRD 非目标与约束）。"
+    },
+    {
+      "id": "entry.workbuddy.followup_new_goal",
+      "status": "未验收",
+      "evidence": null,
+      "usage": "unknown",
+      "unverified_reason": "需真机/真实 provider/真实用量证据；本节点为文档与夹具收口，不执行真实安装、模型下载、Ollama 安装、系统配置或发布（PRD 非目标与约束）。"
+    },
+    {
+      "id": "entry.workbuddy.resume",
+      "status": "未验收",
+      "evidence": null,
+      "usage": "unknown",
+      "unverified_reason": "需真机/真实 provider/真实用量证据；本节点为文档与夹具收口，不执行真实安装、模型下载、Ollama 安装、系统配置或发布（PRD 非目标与约束）。"
+    },
+    {
+      "id": "entry.workbuddy.delegate",
+      "status": "未验收",
+      "evidence": null,
+      "usage": "unknown",
+      "unverified_reason": "需真机/真实 provider/真实用量证据；本节点为文档与夹具收口，不执行真实安装、模型下载、Ollama 安装、系统配置或发布（PRD 非目标与约束）。"
+    },
+    {
+      "id": "entry.workbuddy.auth_lifecycle_fastpath",
+      "status": "未验收",
+      "evidence": null,
+      "usage": "unknown",
+      "unverified_reason": "需真机/真实 provider/真实用量证据；本节点为文档与夹具收口，不执行真实安装、模型下载、Ollama 安装、系统配置或发布（PRD 非目标与约束）。"
+    }
+  ],
+  "acceptance_refs": [
+    "B15",
+    "B16",
+    "B17",
+    "B18",
+    "B19",
+    "B20",
+    "B21",
+    "B22",
+    "B23",
+    "B24",
+    "B25"
+  ],
+  "design_acceptance": [
+    {
+      "ref": "A1",
+      "status": "契约测试已覆盖；真机端到端未验证",
+      "owner_node": "v6-p0b-responsibility"
+    },
+    {
+      "ref": "A2",
+      "status": "契约测试已覆盖；真机端到端未验证",
+      "owner_node": "v6-p0b-responsibility"
+    },
+    {
+      "ref": "A3",
+      "status": "契约测试已覆盖；真机端到端未验证",
+      "owner_node": "v6-p1c-rework-relay"
+    },
+    {
+      "ref": "A4",
+      "status": "契约测试已覆盖；真机端到端未验证",
+      "owner_node": "v6-p0b-responsibility"
+    },
+    {
+      "ref": "A5",
+      "status": "契约测试已覆盖；真机端到端未验证",
+      "owner_node": "v6-p1a-protocol"
+    },
+    {
+      "ref": "A6",
+      "status": "契约测试已覆盖；真机端到端未验证",
+      "owner_node": "v6-p1b-context"
+    },
+    {
+      "ref": "A7",
+      "status": "契约测试已覆盖；真机端到端未验证",
+      "owner_node": "v6-p1b-context"
+    },
+    {
+      "ref": "A8",
+      "status": "契约测试已覆盖；真机端到端未验证",
+      "owner_node": "v6-p0a-baseline"
+    },
+    {
+      "ref": "A9",
+      "status": "契约测试已覆盖；真机端到端未验证",
+      "owner_node": "v6-p2-entry-lean"
+    },
+    {
+      "ref": "A10",
+      "status": "契约测试已覆盖；真机端到端未验证",
+      "owner_node": "v6-p0b-responsibility"
+    },
+    {
+      "ref": "A11",
+      "status": "契约测试已覆盖；真机端到端未验证",
+      "owner_node": "v6-p1a-protocol"
+    },
+    {
+      "ref": "A12",
+      "status": "契约测试已覆盖；真机端到端未验证",
+      "owner_node": "v6-p1a-protocol"
+    }
+  ],
+  "usage": {
+    "measurement_performed": false,
+    "v6_combination_usage": "unknown",
+    "baseline_source": [
+      "outputs/v6-p0a-baseline-run-182893a5.json",
+      "outputs/v6-p0a-baseline-run-91c6d4ab.json"
+    ],
+    "baseline_is_v6_measurement": false,
+    "unknown_policy": "缺失 usage 为 unknown，不填 0（设计 §11.2）；累计事件去重取差、不相加；缺 usage 的会话记 unknown，不记 0。",
+    "baseline_sample_known_partial_tokens": {
+      "contract-env-facts": 131784,
+      "review-protocol-env-facts": 324725,
+      "entrypoint-symbol-multilang": 64904,
+      "monitor-test-execution": 175302,
+      "blocked-unknown-closure": 291963,
+      "integration-review": 363858
+    },
+    "baseline_total_uncached_input_output_tokens": 3847557,
+    "baseline_unknown_sessions": 1,
+    "note": "P0a 基线是升级前用量对照，不是 V6.0 实测；V6.0 各组合整轮 input/output、续接文本 P95 与节省百分比均未实测。"
+  },
+  "unverified_items": [
+    "真机干净首装、V5.2.7 → V6.0 与 V5.2.8 → V6.0 两条升级边未实测：本节点不安装 Ollama、不下载模型、不改系统配置。",
+    "真实 provider（Codex、Claude Code、WorkBuddy）逐请求 hook 触发与 B21–B24 真实首轮/后续 input 未核验；覆盖级别只能实测后降级，不得事后换集合。",
+    "P0a 用量基线之外的 V6.0 各组合整轮 input/output、缓存输入、续接文本 P95 与节省百分比未实测；缺失用量按 unknown 记录、不填 0。",
+    "矩阵外 OS（Windows/Linux/x86_64）与 provider（Cursor、Grok、Kimi Code、DeepSeek Harness、WorkBuddy AI.app）未验证，不在 V6.0 验收内。",
+    "模型档案（型号、量化、许可、磁盘/内存）与 Ollama 版本范围未冻结；升级边精确宿主版本待实测补入。"
+  ],
+  "out_of_scope_actions": [
+    "不真实安装 Ollama、不下载模型、不改系统权限与 AGENTS 规则。",
+    "不做 deploy、发布、tag/Release、merge 或任何 Git 远端动作；本节点只提交 README 与白名单测试夹具。",
+    "不迁移或修改活跃 run，不自动重签旧授权卡。"
+  ],
+  "execution_flags": {
+    "no_real_install": true,
+    "no_model_download": true,
+    "no_deploy": true,
+    "no_system_config_change": true,
+    "no_real_provider_trigger": true
+  },
+  "honesty_statement": "本节点只交付升级说明、兼容与回滚夹具、逐组合绑定报告与契约测试；所有需真机的组合如实标记未验收，不宣称 V6.0 完整发布。"
+}
