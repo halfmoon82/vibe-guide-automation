@@ -113,6 +113,28 @@ class WakeupTests(unittest.TestCase):
         self.snapshot.authorization_digest = 'c' * 64
         self.assertFalse(self.preflight().get('wakeup', {}).get('reused', True))
 
+    def test_changed_task_binding_does_not_reuse_admission(self):
+        # A10: a well-formed receipt must not outlive a changed binding.
+        self.preflight()
+        self.snapshot.node_contract_digest = 'd' * 64
+        self.assertFalse(self.preflight().get('wakeup', {}).get('reused', True))
+
+    def test_tampered_receipt_binding_is_not_reused(self):
+        path = self.paths.vibe / 'runs/run-1/supervisor-wakeup.json'
+        self.preflight()
+        receipt = json.loads(path.read_text())
+        receipt['binding']['authorization_digest'] = 'e' * 64
+        path.write_text(json.dumps(receipt))
+        self.assertFalse(self.preflight().get('wakeup', {}).get('reused', True))
+
+    def test_idle_backoff_keeps_service_cadence_for_unserved_states(self):
+        # A4: only idle backs off; work/unknown keep the base cadence.
+        from vibe_guide.supervisor_wakeup import idle_heartbeat_minutes
+        for state in ('work', 'unknown', 'decision', 'rotate'):
+            self.assertEqual(idle_heartbeat_minutes({'state': state}, base_minutes=10), 10)
+        self.assertEqual(idle_heartbeat_minutes({'state': 'idle'}, base_minutes=10), 30)
+        self.assertEqual(idle_heartbeat_minutes({'state': 'idle'}, base_minutes=10, new_delivery=True), 10)
+
     def test_a_foreign_shift_cannot_create_a_receipt(self):
         register_supervisor_address(self.paths, 'run-1',
             {'provider': 'codex', 'session_id': 'other', 'host': 'local'},
