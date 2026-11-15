@@ -555,3 +555,55 @@ class AutomationSpecTests(unittest.TestCase):
         self.assertFalse(verify_automation_readback(self.HB, None, {"kind": "heartbeat"})[0])
         self.assertFalse(verify_automation_readback(self.HB, dict(self.HB), None)[0])
         self.assertFalse(verify_automation_readback({"kind": "x"}, {}, {})[0])
+
+
+class ExplicitCardChoiceTests(unittest.TestCase):
+    """#405: a Codex card without explicit heartbeat/hard-cap choices is only a draft."""
+
+    def setUp(self):
+        self.plan = Plan("plan-1", 3, "docs/prd.md", ["n1"], "draft")
+        self.nodes = [node("n1", ["a.py"])]
+
+    def _card(self, agent="codex", **kwargs):
+        caps = AgentCapabilities(agent, True, True, True, True, True, "full")
+        return build_authorization_card(self.plan, self.nodes, caps, **kwargs)
+
+    def test_codex_card_without_choices_lists_both_gaps(self):
+        from vibe_guide.authorization import card_choice_gaps
+        gaps = card_choice_gaps(self._card())
+        self.assertEqual([g["field"] for g in gaps], ["heartbeat_interval_minutes", "rotate_hard_cap"])
+
+    def test_codex_card_with_choices_has_no_gaps(self):
+        from vibe_guide.authorization import card_choice_gaps
+        card = self._card(heartbeat_interval_minutes=10, rotate_hard_cap=200000)
+        self.assertEqual(card_choice_gaps(card), [])
+
+    def test_non_codex_card_is_not_forced_codex_options(self):
+        from vibe_guide.authorization import card_choice_gaps
+        self.assertEqual(card_choice_gaps(self._card(agent="claude-code")), [])
+
+    def test_unavailable_selected_tier_is_a_gap_with_reason(self):
+        from vibe_guide.authorization import card_choice_gaps
+        # availability is enforced at build time; a stored card can still carry it
+        from dataclasses import replace as _r
+        base = self._card(heartbeat_interval_minutes=10, rotate_hard_cap=200000)
+        card = _r(base, heartbeat_interval_options=(
+            {"minutes": 10, "available": False, "reason": "能力未验证", "selected": True},
+        ))
+        gaps = card_choice_gaps(card)
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("能力未验证", gaps[0]["reason"])
+
+    def test_authorize_strict_refuses_draft_but_default_stays_compatible(self):
+        card = self._card()
+        authorize(card, "AUTHORIZE")  # legacy callers unchanged
+        with self.assertRaises(ValueError) as ctx:
+            authorize(card, "AUTHORIZE", require_explicit_choices=True)
+        self.assertIn("heartbeat_interval_minutes", str(ctx.exception))
+        self.assertIn("rotate_hard_cap", str(ctx.exception))
+
+    def test_authorize_strict_accepts_complete_codex_card(self):
+        card = self._card(heartbeat_interval_minutes=60, rotate_hard_cap=300000)
+        record = authorize(card, "AUTHORIZE", require_explicit_choices=True)
+        self.assertEqual(record.heartbeat_interval_minutes, 60)
+        self.assertEqual(record.rotate_hard_cap, 300000)
