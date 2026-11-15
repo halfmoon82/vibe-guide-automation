@@ -1218,6 +1218,7 @@ def _authorization_payload(
     contract_test_commands: Optional[Dict[str, Any]] = None,
     heartbeat_interval_minutes: Optional[int] = None,
     rotate_hard_cap: Optional[int] = None,
+    node_cost_cap: Optional[int] = None,
     heartbeat_interval_forced: Optional[bool] = None,
     heartbeat_interval_forced_cost: Optional[str] = None,
     node_scope_digests: Optional[Dict[str, str]] = None,
@@ -1282,6 +1283,11 @@ def _authorization_payload(
         payload["heartbeat_interval_minutes"] = heartbeat_interval_minutes
     if rotate_hard_cap is not None:
         payload["rotate_hard_cap"] = rotate_hard_cap
+    # P1c: the per-node cumulative cost ceiling is part of what was approved.
+    # Same digest-preservation rule: absent when unset, so every earlier record
+    # keeps its digest bit for bit and the runtime keeps the legacy loop limit.
+    if node_cost_cap is not None:
+        payload["node_cost_cap"] = node_cost_cap
     # A forced 30-minute choice is part of what was approved, so it is signed;
     # absent otherwise, which keeps every earlier record digest unchanged.
     if heartbeat_interval_forced:
@@ -1335,6 +1341,7 @@ class AuthorizationCard:
     # approved, so they never enter the digest.
     heartbeat_interval_minutes: Optional[int] = None
     rotate_hard_cap: Optional[int] = None
+    node_cost_cap: Optional[int] = None
     heartbeat_interval_forced: Optional[bool] = None
     heartbeat_interval_forced_cost: Optional[str] = None
     node_scope_digests: Optional[Dict[str, str]] = None
@@ -1417,6 +1424,7 @@ class AuthorizationRecord:
     # keeps carrying exactly the keys it carried before.
     heartbeat_interval_minutes: Optional[int] = None
     rotate_hard_cap: Optional[int] = None
+    node_cost_cap: Optional[int] = None
     heartbeat_interval_forced: Optional[bool] = None
     heartbeat_interval_forced_cost: Optional[str] = None
     node_scope_digests: Optional[Dict[str, str]] = None
@@ -1458,7 +1466,7 @@ class AuthorizationRecord:
             "digest",
             "agent_id",
         }
-        allowed = required | {"node_scope_digests", "remote_git_actions", "required_workflow", "skipped_nodes", "integration_contract_digest", "integration_node_id", "integration_review_scope", "execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "engine_authorization_digest", "explicit_execution_mode_override", "workers", "topology_summary", "contract_test_commands", "remote_git_actions_options", "remote_git_actions_scope", "deploy_authorization", "heartbeat_interval_minutes", "rotate_hard_cap", "heartbeat_interval_forced", "heartbeat_interval_forced_cost", "heartbeat_interval_options", "rotate_hard_cap_options", "daemon", "launchd_keepalive"}
+        allowed = required | {"node_scope_digests", "remote_git_actions", "required_workflow", "skipped_nodes", "integration_contract_digest", "integration_node_id", "integration_review_scope", "execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "engine_authorization_digest", "explicit_execution_mode_override", "workers", "topology_summary", "contract_test_commands", "remote_git_actions_options", "remote_git_actions_scope", "deploy_authorization", "heartbeat_interval_minutes", "rotate_hard_cap", "node_cost_cap", "heartbeat_interval_forced", "heartbeat_interval_forced_cost", "heartbeat_interval_options", "rotate_hard_cap_options", "daemon", "launchd_keepalive"}
         if not isinstance(data, dict) or not required.issubset(data) or not set(data).issubset(allowed):
             raise ValueError("authorization record schema is invalid")
         if data["schema_version"] != AUTHORIZATION_SCHEMA_VERSION:
@@ -1470,6 +1478,7 @@ class AuthorizationRecord:
         converted.setdefault("remote_git_actions", "deny")
         converted.setdefault("heartbeat_interval_minutes", None)
         converted.setdefault("rotate_hard_cap", None)
+        converted.setdefault("node_cost_cap", None)
         converted.setdefault("heartbeat_interval_forced", None)
         converted.setdefault("heartbeat_interval_forced_cost", None)
         converted.setdefault("daemon", DAEMON_DEFAULT)
@@ -1479,6 +1488,7 @@ class AuthorizationRecord:
             converted["heartbeat_interval_minutes"], "heartbeat interval minutes"
         )
         _validate_stored_card_choice(converted["rotate_hard_cap"], "rotation hard cap")
+        _validate_stored_card_choice(converted["node_cost_cap"], "node cost cap")
         if converted["remote_git_actions"] not in {"allow", "deny"}:
             raise ValueError("authorization remote git action switch is invalid")
         for key in ("required_workflow", "skipped_nodes", "integration_review_scope"):
@@ -1767,7 +1777,7 @@ def _drop_unset_card_fields(result: Dict[str, Any]) -> Dict[str, Any]:
     what a pre-209 card did -- must be byte-identical to the ones issued before
     the option existed, so their stored digests keep verifying.
     """
-    for key in ("node_scope_digests", "heartbeat_interval_minutes", "rotate_hard_cap",
+    for key in ("node_scope_digests", "heartbeat_interval_minutes", "rotate_hard_cap", "node_cost_cap",
                 "heartbeat_interval_forced", "heartbeat_interval_forced_cost",
                 "dependency_graph"):
         if result.get(key) is None:
@@ -1826,6 +1836,7 @@ def build_authorization_card(
     topology_rulings: Optional[Dict[str, str]] = None,
     heartbeat_interval_minutes: Optional[int] = None,
     rotate_hard_cap: Optional[int] = None,
+    node_cost_cap: Optional[int] = None,
     heartbeat_interval_forced: Optional[bool] = None,
     heartbeat_interval_forced_cost: Optional[str] = None,
     heartbeat_interval_options: Optional[Any] = None,
@@ -2062,6 +2073,7 @@ def build_authorization_card(
         contract_test_commands=contract_test_commands,
         heartbeat_interval_minutes=heartbeat_interval_minutes,
         rotate_hard_cap=rotate_hard_cap,
+        node_cost_cap=node_cost_cap,
         heartbeat_interval_forced=heartbeat_interval_forced,
         heartbeat_interval_forced_cost=heartbeat_interval_forced_cost,
         node_scope_digests={node.id: legacy_executable_contract_digest([node]) for node in nodes},
@@ -2180,6 +2192,7 @@ def refresh_authorization_card(
         workers=workers,
         heartbeat_interval_minutes=previous.heartbeat_interval_minutes,
         rotate_hard_cap=previous.rotate_hard_cap,
+        node_cost_cap=previous.node_cost_cap,
         heartbeat_interval_forced=previous.heartbeat_interval_forced,
         heartbeat_interval_forced_cost=previous.heartbeat_interval_forced_cost,
         daemon=previous.daemon,
@@ -2287,6 +2300,7 @@ def authorize(
         contract_test_commands=card.contract_test_commands,
         heartbeat_interval_minutes=card.heartbeat_interval_minutes,
         rotate_hard_cap=card.rotate_hard_cap,
+        node_cost_cap=card.node_cost_cap,
         heartbeat_interval_forced=card.heartbeat_interval_forced,
         heartbeat_interval_forced_cost=card.heartbeat_interval_forced_cost,
         node_scope_digests=card.node_scope_digests,
@@ -2331,6 +2345,7 @@ def authorize(
         contract_test_commands=card.contract_test_commands,
         heartbeat_interval_minutes=card.heartbeat_interval_minutes,
         rotate_hard_cap=card.rotate_hard_cap,
+        node_cost_cap=card.node_cost_cap,
         heartbeat_interval_forced=card.heartbeat_interval_forced,
         heartbeat_interval_forced_cost=card.heartbeat_interval_forced_cost,
         node_scope_digests=card.node_scope_digests,
@@ -2407,6 +2422,7 @@ def is_authorization_integrity_valid(record: AuthorizationRecord) -> bool:
         contract_test_commands=record.contract_test_commands,
         heartbeat_interval_minutes=record.heartbeat_interval_minutes,
         rotate_hard_cap=record.rotate_hard_cap,
+        node_cost_cap=record.node_cost_cap,
         heartbeat_interval_forced=record.heartbeat_interval_forced,
         heartbeat_interval_forced_cost=record.heartbeat_interval_forced_cost,
         node_scope_digests=record.node_scope_digests,

@@ -49,7 +49,7 @@ from .remote_delivery import REMOTE_DELIVERY_AUDIT_EVENTS
 from .paths import ProjectPaths
 from .path_ownership import validate_path_ownership
 from .binding_lifecycle import VisibleSddAcceptance
-from . import digests, fsio, monitor_acceptance, monitor_contracts, monitor_handoff
+from . import digests, fsio, handoff_rebind, monitor_acceptance, monitor_contracts, monitor_handoff
 from .monitor_acceptance import VISIBLE_SDD_PROTOCOL_REF
 from .planner import (
     ScopeExpansionResolution,
@@ -979,7 +979,7 @@ RECOVERY_FIDELITY_AUDIT = (
     },
     {
         "site": "_release_node_lease",
-        "call_sites": 27,
+        "call_sites": 28,
         "callers": (
             {
                 "caller": "_recover_reverse_blocked_acceptance",
@@ -994,7 +994,7 @@ RECOVERY_FIDELITY_AUDIT = (
                 "caller": (
                     "_apply_event, _start_task, reauthorize, _schedule_ready "
                     "helpers, _reconcile_unapplied_events and the remaining "
-                    "terminal-transition callers (the other 26 sites, including the #376 provider-400 successor retirement, the #290 contract_error replay that re-plans an integration-review node, the #335 _park_blocked_engineering / blocked_engineering replay pair that parks a blocked self-report, and the #336 landing-unreadable replay twin)"
+                    "terminal-transition callers (the other 27 sites, including the #376 provider-400 successor retirement, the #290 contract_error replay that re-plans an integration-review node, the #335 _park_blocked_engineering / blocked_engineering replay pair that parks a blocked self-report, and the #336 landing-unreadable replay twin)"
                 ),
                 "verdict": "different_type",
                 "rationale": (
@@ -1008,13 +1008,13 @@ RECOVERY_FIDELITY_AUDIT = (
     },
     {
         "site": "_mark_blocked_unknown",
-        "call_sites": 55,
+        "call_sites": 58,
         "callers": (
             {
                 "caller": (
                     "_apply_event, _start_task, _schedule_ready, "
                     "_accept_visible_sdd_delivery and the remaining block "
-                    "sites (the other 48 sites, including the #376 provider-400 escalation and its unrecorded-binding wait)"
+                    "sites (the other 51 sites, including the #376 provider-400 escalation and its unrecorded-binding wait)"
                 ),
                 "verdict": "different_type",
                 "rationale": (
@@ -8107,6 +8107,10 @@ class Monitor:
                 except (TypeError, ValueError):
                     review_round = 1
                 current["review_loop_rounds"] = review_round
+                if self._bounded_rework_relay(
+                    snapshot, node_id, current, active, role, handle_id, runner, event
+                ):
+                    return
                 if review_round == 2:
                     before = self._effective_model_tier(self.nodes[node_id], current, "developer")
                     if before != model_catalog.TIERS[-1]:
@@ -9281,6 +9285,109 @@ escalation, quarantine_lease=False, retryable_same_task=False, reason_code=code)
             "reason_class": classification["kind"], "reason": reason,
             "same_task_required": True, "next_retry_at": current.get("retryable_action", {}).get("next_retry_at") if isinstance(current.get("retryable_action"), dict) else None})
         self._save_snapshot(snapshot)
+
+    def _bounded_rework_relay(
+        self, snapshot, node_id, current, active, role, handle_id, runner, event
+    ) -> bool:
+        """P1c: count a failed re-review against the node ledger; relay at the limit.
+
+        Only runs when the authorization card carries ``node_cost_cap``; cards
+        without it keep the legacy review-loop limit.  Returns True when this
+        finding was fully handled here (relay queued or node parked).
+        """
+        cap = getattr(self._snapshot_record(snapshot), "node_cost_cap", None)
+        if cap is None:
+            return False
+        data = event.data if isinstance(event.data, dict) else {}
+        action_id = str(data.get("action_id") or data.get("finding_id") or
+                        "seq:{}".format(snapshot.event_sequence))
+        cost = data.get("cost") if type(data.get("cost")) is int else 0
+        ledger, counted = handoff_rebind.record_review_failure(
+            current.get("rework_ledger"), action_id=action_id, finding=data,
+            reason_class=data.get("reason_class"), cost=cost)
+        current["rework_ledger"] = ledger
+        self._record(snapshot, "rework_round_counted", {
+            "run_id": snapshot.run_id, "node_id": node_id,
+            "proof": {"ledger": ledger, "counted": counted, "action_id": action_id},
+        }, active)
+        if handoff_rebind.cost_exhausted(ledger, cap):
+            if not self._stop_active_for_transition(
+                snapshot, node_id, role, handle_id, runner, "stopped"
+            ):
+                return True
+            self._mark_blocked_unknown(
+                snapshot, node_id,
+                "node cost cap reached; global diagnosis required before any further relay",
+                reason_code="node_cost_cap_reached")
+            return True
+        # With a node cap the ledger is the only round counter: keep the legacy
+        # review-loop counter in step with it so it can never park a relayed
+        # worker (its count restarts per worker) or one whose findings did not
+        # count (upstream faults, format-only corrections).
+        current["review_loop_rounds"] = ledger["local_rounds"]
+        if not handoff_rebind.relay_due(ledger):
+            return False
+        # Third failed re-review: no fourth round.  The old developer is
+        # archived (terminal proof happens in the scheduler before the new
+        # writer starts), the reviewer identity is kept.
+        try:
+            self._set_binding_status(snapshot, node_id, "developer", "archived")
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            self._mark_blocked_unknown(
+                snapshot, node_id,
+                "relay predecessor developer binding cannot be proven terminal",
+                reason_code="relay_predecessor_unproven")
+            return True
+        worktree = str(current.get("worktree") or "")
+        try:
+            head = subprocess.check_output(
+                ["git", "-C", worktree, "rev-parse", "HEAD"], text=True,
+                stderr=subprocess.STDOUT, timeout=5).strip()
+            dirty = [line[3:] for line in subprocess.check_output(
+                ["git", "-C", worktree, "status", "--porcelain"], text=True,
+                stderr=subprocess.STDOUT, timeout=5).splitlines()]
+        except (OSError, subprocess.SubprocessError):
+            head, dirty = "unknown", []
+        current["active_role"] = None
+        current["active_task"] = None
+        snapshot.handles.pop(node_id, None)
+        predecessor = self._prove_old_task_stopped_or_absent(
+            snapshot, node_id, {"successor_candidate": True, "role": "developer"})
+        if not predecessor:
+            self._mark_blocked_unknown(
+                snapshot, node_id,
+                "relay predecessor developer stop cannot be proven; no second writer started",
+                reason_code="relay_predecessor_unproven")
+            return True
+        ledger = handoff_rebind.start_relay(ledger)
+        current["rework_ledger"] = ledger
+        current["review_loop_rounds"] = 0
+        current["relay_pack"] = handoff_rebind.relay_pack(
+            node_id=node_id, head=head, dirty_files=dirty, ledger=ledger,
+            predecessor_task_id=str(predecessor or ""),
+            reviewer_identity=str(current.get("reviewer_identity") or ""))
+        current["status"] = "rework"
+        # Retire the pair slot exactly like the reviewer-replacement path: the
+        # successor developer is a new session and the scheduler counts it
+        # against the concurrency budget only via pending_schedule.
+        current["pair_archived"] = True
+        current["active_role"] = None
+        current["active_task"] = None
+        snapshot.handles.pop(node_id, None)
+        current["retryable_action"] = {
+            "role": "developer", "phase": "rework", "continuation": False,
+            "successor_candidate": False, "pending_schedule": True,
+            "successor": True, "same_task": False,
+            "predecessor_task_id": predecessor,
+        }
+        self._release_node_lease(snapshot, node_id)
+        self._record(snapshot, "rework_relay_started", {
+            "run_id": snapshot.run_id, "node_id": node_id,
+            "predecessor_task_id": predecessor,
+            "proof": {"ledger": ledger, "frozen_head": head,
+                      "uncommitted_files": current["relay_pack"]["uncommitted_files"]},
+        }, active)
+        return True
 
     def _park_review_loop(
         self, snapshot, node_id, current, active, role, handle_id, runner, review_round
@@ -11434,6 +11541,30 @@ escalation, quarantine_lease=False, retryable_same_task=False, reason_code=code)
                     "reason": "delivery landing cannot be confirmed",
                 }
                 self._release_node_lease(snapshot, node_id)
+            elif record["event"] in {"rework_round_counted", "rework_relay_started"}:
+                # Crash-window twin: the ledger is carried in ``proof``, so the
+                # event alone restores it (never double counts, never resets).
+                proof = data.get("proof")
+                if not isinstance(proof, dict) or not isinstance(proof.get("ledger"), dict):
+                    raise ValueError("replayed rework ledger evidence is invalid")
+                current["rework_ledger"] = handoff_rebind._ledger(proof["ledger"])
+                if record["event"] == "rework_relay_started":
+                    # Same replay contract as review_loop_limit_reached: restore
+                    # every relay marker so the queued successor stays
+                    # dispatchable instead of degrading to manual reconciliation.
+                    current["status"] = "rework"
+                    current["pair_archived"] = True
+                    current["review_loop_rounds"] = 0
+                    current["active_role"] = None
+                    current["active_task"] = None
+                    snapshot.handles.pop(node_id, None)
+                    current["retryable_action"] = {
+                        "role": "developer", "phase": "rework",
+                        "continuation": False, "successor_candidate": False,
+                        "pending_schedule": True, "successor": True,
+                        "same_task": False,
+                        "predecessor_task_id": data.get("predecessor_task_id"),
+                    }
             elif record["event"] in WORKER_QUESTION_REPLAY_EVENTS:
                 # The park/answer paths append the event before the snapshot
                 # save; a crash in between must not turn the open question
