@@ -67,6 +67,17 @@ class ProbeTests(unittest.TestCase):
         self.assertFalse(result["local"])
         self.assertFalse(result["send_project_data"])
 
+    def test_lookalike_127_hostnames_are_remote(self):
+        for host in ("127.evil.com", "127.0.0.1.evil.com", "127.0.0.1.nip.io"):
+            result = local_model.probe_ollama(endpoint="http://%s:11434" % host, fetch=_fetch_ok())
+            self.assertEqual(result["status"], "remote_endpoint", host)
+            self.assertFalse(result["local"], host)
+            self.assertFalse(result["send_project_data"], host)
+
+    def test_loopback_ip_range_is_local(self):
+        for host in ("127.0.0.2", "127.1.2.3", "[::1]", "localhost"):
+            self.assertTrue(local_model._is_local_endpoint("http://%s:11434" % host), host)
+
     def test_wrong_shape_response_is_unknown(self):
         result = local_model.probe_ollama(endpoint="http://127.0.0.1:11434", fetch=_fetch_ok(payload=["x"]))
         self.assertEqual(result["status"], "unknown")

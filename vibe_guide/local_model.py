@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import urllib.error
@@ -57,9 +58,12 @@ def _is_local_endpoint(endpoint: str) -> bool:
     except ValueError:
         return False
     host = host.lower()
-    if host in {"localhost", "127.0.0.1", "::1", "[::1]"}:
+    if host == "localhost":
         return True
-    return host.startswith("127.")
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False
 
 
 def _record_path(project_root: Path | str) -> Path:
