@@ -14,7 +14,7 @@ dev 子代理实现 → review 子代理审查 →（存在 P0–P2）返工回 
 1. **dev 子代理**：按节点合同实现，只写文件白名单内的文件，完成后跑合同列明的定向验证。
    **派发时必须把子代理钉在合同的 `worktree` 上**：宿主有 `cwd` 参数就传 `cwd`；WorkBuddy 的 Agent
    工具没有 `cwd`，只能在提示里要求它**每条命令先 `cd <worktree>`**、写文件用绝对路径——漏一条命令
-   就落回主项目树（见 prd-guide §6.3）。review 子代理同理。唯一例外是第 5 节的 `vibe worker-deliver`：
+   就落回主项目树（见 execution §6.3）。review 子代理同理。唯一例外是第 5 节的 `vibe worker-deliver`：
    它必须带 `--project-root <主项目绝对路径>`（或设 `VIBE_PROJECT_ROOT`），不依赖当前目录。
    **WorkBuddy 降级路径**（单次运行观察：run-9fef3109，2026-11-03，issue #390，宿主版本未知，非已验证、非永久限制）：
    Agent 工具 general-purpose 类型下 claude 系模型曾被内容策略拦、gpt 系模型不被个人免费用户允许时，

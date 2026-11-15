@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PRD_GUIDE = ROOT / "vibe_guide" / "protocols" / "prd-guide.md"
+PRD_GUIDE = ROOT / "vibe_guide" / "protocols" / "execution.md"
 SUPERVISOR_CARD = ROOT / "vibe_guide" / "protocols" / "supervisor-card.md"
 
 

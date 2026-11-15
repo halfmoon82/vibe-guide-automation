@@ -63,7 +63,7 @@ class TableDrivesEveryCopy(unittest.TestCase):
 
     @staticmethod
     def shipped_doc_table():
-        text = load_protocol("prd-guide")
+        text = load_protocol("execution")
         return text[text.index(DOC_TABLE_BEGIN) + len(DOC_TABLE_BEGIN):text.index(DOC_TABLE_END)].strip()
 
     def test_prd_guide_table_is_the_rendered_table(self):

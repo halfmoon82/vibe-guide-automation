@@ -99,7 +99,7 @@ class ProtocolShippingTests(unittest.TestCase):
         """
         from vibe_guide.contracts import THIRD_PARTY_UI_LIBRARY_MARKERS, _REPO_PATH_SUFFIXES
         from vibe_guide.protocols import load_protocol
-        text = load_protocol("prd-guide")
+        text = load_protocol("execution")
         self.assertIn("environment_facts", text)
         self.assertIn("THIRD_PARTY_UI_LIBRARY_MARKERS", text)
         for marker in THIRD_PARTY_UI_LIBRARY_MARKERS:
@@ -137,9 +137,10 @@ class ScopeRuleSectionTests(unittest.TestCase):
     def _sections(self):
         from vibe_guide.protocols import load_protocol
         text = load_protocol("prd-guide")
+        execution = load_protocol("execution")
         return text, self._section(text, "## 4. 拆节点"), \
-            self._section(text, "## 6. 监工：守护程序"), \
-            self._section(text, "## 7. 什么时候才能打断产品经理")
+            self._section(execution, "## 6. 监工：守护程序"), \
+            self._section(execution, "## 7. 什么时候才能打断产品经理")
 
     def _section(self, text, heading):
         """Return one numbered section, up to the next heading at the same level.
@@ -283,7 +284,7 @@ class MailboxSectionTests(unittest.TestCase):
 
     def protocol(self):
         from vibe_guide.protocols import load_protocol
-        return load_protocol("prd-guide")
+        return load_protocol("execution")
 
     def test_protocol_embeds_the_generated_single_line_heartbeat_command(self):
         from vibe_guide.supervisor import heartbeat_command
@@ -1441,7 +1442,7 @@ class StallSelfHealSectionTests(unittest.TestCase):
 
     def _levels(self):
         from vibe_guide.protocols import load_protocol
-        text = load_protocol("prd-guide")
+        text = load_protocol("execution")
         start = text.index("### 6.1 ")
         end = text.find("\n### ", start + 1)
         section = text[start:end if end != -1 else len(text)]

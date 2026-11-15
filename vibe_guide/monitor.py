@@ -8519,7 +8519,7 @@ class Monitor:
         """Gateway 400 on a background session: same task first, successor second.
 
         The session is already ``failed`` at the provider, so the old session
-        is confirmed gone.  Recovery order (prd-guide section 7): continue the
+        is confirmed gone.  Recovery order (execution section 7): continue the
         same task with a short backoff; only when the session can no longer be
         continued retire its binding and queue a successor.  Three identical
         failures in a row escalate with the provider 400 named.

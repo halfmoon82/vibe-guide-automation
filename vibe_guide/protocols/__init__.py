@@ -21,12 +21,31 @@ VIBE_ENTRY_NAME = "vibe-entry"
 #: The new-session entry protocol materializes next to prd-guide.
 VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 
+EXECUTION_NAME = "execution"
+#: The post-authorization execution protocol (what used to be prd-guide §6/§7)
+#: materializes alongside the planning protocols.  Runs authorized before its
+#: introduction keep reading the copies their authorization pinned; an old
+#: run's project is never migrated onto a protocol text it did not ship.
+EXECUTION_PROPOSAL_RELATIVE = ".vibe/proposals/skills/execution/SKILL.md"
+
 #: sha256 of every prd-guide / vibe-entry text vibe has ever shipped, the
 #: current one included.  A project copy matching one of these is an unedited
 #: earlier release and may be refreshed; any other text is a local edit and is
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
+    # P1a: §6/§7 (supervision and interrupt rules) moved out of the planning
+    # protocol into ``execution``; every earlier prd-guide text that still
+    # carries them stays pinned here so old runs keep their pinned copies.
+    "execution": frozenset({
+        # 2026-11-15: first execution protocol, split verbatim from prd-guide
+        # §6/§7 with a short head and reading map (section numbers unchanged,
+        # so every §6.x/§7 cross-reference stays valid).
+        "149f040d52cde4925c4dcc3599e739f7b0f72e89602beb404acf75e58bccd676",
+    }),
     "prd-guide": frozenset({
+        # 2026-11-15: P1a decoupling — §6/§7 moved to protocols/execution.md;
+        # the planning protocol ends at §5 with a pointer (see §6 tail).
+        "1df1e12520fdaf6250402a188917858f1e0a0f4ed4dfed12443201a2599374d1",
         # 2026-11-10: supervisor-register examples carry --wake-target <会话名>
         # (a UUID target is unreachable for SendMessage).
         "03269794c00fe329d563d45179cc417ce71e2d7b5687ef36b67a9e10fa8e8cb9",
@@ -224,6 +243,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "4336b8a2977974248dbec483a4e8440ed60768234d76ffc0a6ac685e12ee97c5",
     }),
     "vibe-entry": frozenset({
+        # 2026-11-15: P1a pointers to §6/§7 now name execution, not prd-guide.
+        "bf7fdfadb7cf5709506035790ae7d5e13976e7ea578eb6fbbdcb8c7e37659702",
         # 2026-11-10: first-shift register example carries --wake-target <会话名>.
         "fbdfab762b417d2a45198a5c640fa1fd6fba5ff41e09c4d3a2ba9e9f8995a500",
         # 2026-10-31: monitor auto-starts the daemon; launchd keep-alive is the only auto-restart path.
@@ -255,6 +276,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
     # Worker protocol delivered by reference (#216): a ref-mode dispatch pins
     # the file's sha256 and only accepts a digest published here.
     "visible-sdd-worker": frozenset({
+        # 2026-11-15: P1a pointers to §6/§7 now name execution, not prd-guide.
+        "dae56c60bdb932baf1c9e19b80b030b00572f18187bc633dd4fb4489849ddaae",
         # 2026-11-03: WorkBuddy Explore-type subagent fallback (single-run observation, #390).
         "9c65bef62c1d30ede26db9153a272349f34043f1d0326bfdb5fa22e8ce70af84",
         # 2026-10-30: worker-deliver takes --project-root, no cwd.
@@ -264,6 +287,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
     # Short per-beat runbook; the beat prints it once per shift, then only
     # its path and sha256.
     "supervisor-card": frozenset({
+        # 2026-11-15: P1a pointers to §6/§7 now name execution, not prd-guide.
+        "2cc0a5f12f1c48df85a36f69c23e54a14cfab331441ad53b41e3e397dd9fcb56",
         # 2026-11-03: decision boundary names the platform-handoff disclosure
         # exception; wording trimmed to stay within 3072 bytes (card-and-handoff).
         "b26036fdbcdbcf344cbf0590d2aac3ce1fe24f68c8ef8dd49446b189e72e49c3",
