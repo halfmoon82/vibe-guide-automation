@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .digests import sha256_bytes
-from .planner import RouteResult, S0Result, S1Score, TaskContext, EXPLICIT_COMPLEX_FLAG, asks_for_complex, classify_s0, is_continuation_message, parse_s1_context, route_task, score_s1
+from .planner import RouteResult, S0Result, S1Score, TaskContext, EXPLICIT_COMPLEX_FLAG, SAFEGUARDS, OrchestrationFacts, asks_for_complex, classify_s0, decide_execution_tier, is_continuation_message, parse_s1_context, route_task, score_s1
 
 
 def _normalize_request(request: str) -> str:
@@ -265,26 +265,108 @@ class ContinuationMessage(ValueError):
     """The request only confirms/selects/continues work already under way."""
 
 
-def entry_route(request: str, s1: Any = None, current_tier: Optional[str] = None) -> Dict[str, Any]:
-    """Route a message without creating a plan: simple / light_plan / complex /
-    continue_current.
+#: Events already bound to an execution contract plus a valid run/task.  They go
+#: straight to the execution protocol's minimal identity/authorization/state
+#: preflight: no S1, no plan, no PRD protocol.
+BOUND_EVENTS = ("continue", "rework", "heartbeat", "handoff")
+#: Only a user's own continue message can carry a brand-new goal; rework,
+#: heartbeat and handoff are system events with no goal text to re-judge.
+_USER_AUTHORED_EVENTS = ("continue",)
 
-    A confirm/select/continue reply returns ``continue_current`` carrying the
-    session's current tier; it is never re-scored.  Everything else is scored
-    and routed exactly as ``build_session_entry`` would.
+
+def entry_route(request: str, s1: Any = None, current_tier: Optional[str] = None, binding: Optional[str] = None) -> Dict[str, Any]:
+    """Route a message without creating a plan.
+
+    Legacy ``route`` (simple / light_plan / complex / continue_current) keeps its
+    meaning; a new request additionally carries ``execution_tier``
+    (direct / lean / run) with a reason.  A reliably bound continue / rework /
+    heartbeat / handoff takes the fast path and is never re-scored.  A bare
+    "continue" with no binding does not guess a task (``binding: "none"``).
     """
+    if binding is not None and binding not in BOUND_EVENTS:
+        raise ValueError("binding must be one of {}".format("/".join(BOUND_EVENTS)))
     normalized = _normalize_request(request)
-    if not normalized:
+    if not normalized and binding is None:
         raise ValueError("request is required")
+    if binding is not None and s1 is None and (binding not in _USER_AUTHORED_EVENTS or not normalized or is_continuation_message(normalized)):
+        return {"route": CONTINUE_CURRENT, "tier": current_tier, "fast_path": binding, "binding": binding, "score_line": None, "unmet_conditions": []}
     if s1 is None and is_continuation_message(normalized):
-        return {"route": CONTINUE_CURRENT, "tier": current_tier, "score_line": None, "unmet_conditions": []}
+        return {"route": CONTINUE_CURRENT, "tier": current_tier, "binding": "none", "score_line": None, "unmet_conditions": []}
     entry = build_session_entry(normalized, s1)
+    context = parse_s1_context(s1)
+    facts = context.orchestration if context is not None and context.orchestration is not None else OrchestrationFacts()
+    if EXPLICIT_COMPLEX_FLAG in entry.route.force_upgrade_flags:
+        facts = replace(facts, explicit_run=True)
+    decision = decide_execution_tier(entry.s1.total, facts)
     return {
         "route": entry.route.route,
         "tier": entry.route.route,
         "score_line": entry.route.score_line,
         "unmet_conditions": list(entry.route.unmet_conditions),
+        "execution_tier": decision.tier,
+        "tier_reason": decision.reason,
+        "unknown_facts": list(decision.unknown_facts),
+        "contradiction": decision.contradiction,
     }
+
+
+def _replay_decision(sample: Dict[str, Any]):
+    """Route one sample from its entry-visible facts only; outcome never enters."""
+    facts = sample.get("facts") or {}
+    score = facts.get("score")
+    if score is None:
+        return None
+    return decide_execution_tier(score, OrchestrationFacts(
+        nodes=facts.get("nodes"), parallel=facts.get("parallel"),
+        duration=facts.get("duration"), coordination=facts.get("coordination")))
+
+
+def _replay_part(samples) -> Dict[str, Any]:
+    outside, disputed, unknown, legacy_diff = [], [], 0, []
+    roots = set()
+    for sample in samples:
+        roots.add(sample.get("root_task", sample["id"]))
+        allowed = sample.get("allowed_tiers") or []
+        if len(allowed) > 1:
+            disputed.append(sample["id"])
+        if sample.get("bound_event"):
+            tier = "fast_path"  # a bound event is never scored
+        else:
+            decision = _replay_decision(sample)
+            tier = decision.tier if decision else None
+            if decision and decision.unknown_facts:
+                unknown += 1
+            score = (sample.get("facts") or {}).get("score")
+            if decision and score is not None:
+                legacy = "simple" if score <= 8 else "light_plan" if score <= 15 else "complex"
+                if {"simple": "direct", "light_plan": "lean", "complex": "run"}[legacy] != decision.tier:
+                    legacy_diff.append(sample["id"])
+        if tier not in allowed:
+            outside.append({"id": sample["id"], "tier": tier, "allowed": allowed})
+    return {
+        "samples": len(samples),
+        "root_tasks": len(roots),
+        "outside_allowed": outside,
+        "disputed": disputed,
+        "with_unknown_facts": unknown,
+        "legacy_disagreements": legacy_diff,
+    }
+
+
+def replay_routing(historical, synthetic) -> Dict[str, Any]:
+    """Replay labelled samples through the tier decision.
+
+    History and synthetic boundaries are reported apart.  A sample whose
+    ``risk_requirements`` name something outside the shared safeguards is a
+    veto of its own, not folded into accuracy.
+    """
+    vetoes = []
+    for source, samples in (("historical", historical), ("synthetic", synthetic)):
+        for sample in samples:
+            missing = [item for item in sample.get("risk_requirements") or [] if item not in SAFEGUARDS]
+            if missing:
+                vetoes.append({"id": sample["id"], "source": source, "missing_safeguards": missing})
+    return {"historical": _replay_part(historical), "synthetic": _replay_part(synthetic), "vetoes": vetoes}
 
 
 def build_session_entry(request: str, s1: Any = None, plan_id: Optional[str] = None) -> SessionEntry:

@@ -249,3 +249,40 @@ class VibeEntryMaterializationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ThreeTierEntryProtocolTests(unittest.TestCase):
+    def setUp(self):
+        from vibe_guide.protocols import load_protocol
+        self.entry = load_protocol("vibe-entry")
+
+    def test_entry_names_the_three_tiers_and_fast_path(self):
+        for token in ("execution_tier", "direct", "lean", "run", "lean-supervisor", "快路径"):
+            self.assertIn(token, self.entry, token)
+
+    def test_high_score_single_node_and_long_serial_are_not_split(self):
+        self.assertIn("不强拆", self.entry)
+
+    def test_lean_supervisor_protocol_ships_and_stays_small(self):
+        from vibe_guide.protocols import load_protocol
+        text = load_protocol("lean-supervisor")
+        self.assertLessEqual(len(text.encode("utf-8")), 6 * 1024)
+
+    def test_lean_supervisor_keeps_review_and_authorization(self):
+        from vibe_guide.protocols import load_protocol
+        text = load_protocol("lean-supervisor")
+        for token in ("授权卡", "独立", "只读", "3 轮", "升级"):
+            self.assertIn(token, text, token)
+
+    def test_lean_supervisor_does_not_copy_akasha(self):
+        from vibe_guide.protocols import load_protocol
+        text = load_protocol("lean-supervisor")
+        self.assertIn("只借鉴", text)
+        self.assertNotIn("akasha-grimoire", text.lower())
+
+    def test_both_protocols_are_registered_as_shipped(self):
+        import hashlib
+        from vibe_guide.protocols import SHIPPED_PROTOCOL_DIGESTS, load_protocol
+        for name in ("vibe-entry", "lean-supervisor"):
+            digest = hashlib.sha256(load_protocol(name).encode("utf-8")).hexdigest()
+            self.assertIn(digest, SHIPPED_PROTOCOL_DIGESTS[name], name)

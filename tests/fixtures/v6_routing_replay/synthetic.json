@@ -1,0 +1,32 @@
+{
+  "kind": "synthetic",
+  "note": "合成边界场景，不是已验证历史结果，与历史样本分开报告。",
+  "samples": [
+    {"id": "S-single-writer-high-risk", "root_task": "syn-1", "facts": {"score": 17, "nodes": 1, "parallel": 1, "duration": "session", "coordination": false},
+     "allowed_tiers": ["direct"], "risk_requirements": ["授权卡", "独立审查"]},
+    {"id": "S-four-node-recovery", "root_task": "syn-2", "facts": {"score": 16, "nodes": 4, "parallel": 2, "duration": "resume", "coordination": true},
+     "allowed_tiers": ["run"], "risk_requirements": ["授权卡"]},
+    {"id": "S-high-score-readonly-analysis", "root_task": "syn-3", "facts": {"score": 18, "nodes": 1, "parallel": 1, "duration": "session", "coordination": false},
+     "allowed_tiers": ["direct"], "risk_requirements": []},
+    {"id": "S-low-score-many-nodes", "root_task": "syn-4", "facts": {"score": 8, "nodes": 10, "parallel": 3, "duration": "multiday", "coordination": null},
+     "allowed_tiers": ["lean", "run"], "risk_requirements": [], "expect_contradiction": true},
+    {"id": "S-s1-12-single-half-hour", "root_task": "syn-5", "facts": {"score": 12, "nodes": 1, "parallel": 1, "duration": "session", "coordination": false},
+     "allowed_tiers": ["direct"], "risk_requirements": []},
+    {"id": "S-s1-14-three-independent", "root_task": "syn-6", "facts": {"score": 14, "nodes": 3, "parallel": 3, "duration": "session", "coordination": false},
+     "allowed_tiers": ["lean"], "risk_requirements": []},
+    {"id": "S-s1-18-two-nodes", "root_task": "syn-7", "facts": {"score": 18, "nodes": 2, "parallel": 2, "duration": "session", "coordination": false},
+     "allowed_tiers": ["lean"], "risk_requirements": []},
+    {"id": "S-s1-19-eight-nodes-multiday", "root_task": "syn-8", "facts": {"score": 19, "nodes": 8, "parallel": 4, "duration": "multiday", "coordination": null},
+     "allowed_tiers": ["run"], "risk_requirements": ["授权卡"]},
+    {"id": "S-s1-20-long-serial", "root_task": "syn-9", "facts": {"score": 20, "nodes": 1, "parallel": 1, "duration": "multiday", "coordination": false},
+     "allowed_tiers": ["lean"], "risk_requirements": []},
+    {"id": "S-unknown-facts", "root_task": "syn-10", "facts": {"score": 12, "nodes": null, "parallel": null, "duration": null, "coordination": null},
+     "allowed_tiers": ["lean", "direct"], "risk_requirements": []},
+    {"id": "S-many-short-homogeneous", "root_task": "syn-11", "facts": {"score": 14, "nodes": 12, "parallel": 2, "duration": "session", "coordination": false},
+     "allowed_tiers": ["lean"], "risk_requirements": []},
+    {"id": "S-continue-bound", "root_task": "syn-12", "bound_event": "continue", "facts": {},
+     "allowed_tiers": ["fast_path"], "risk_requirements": []},
+    {"id": "S-heartbeat-bound", "root_task": "syn-13", "bound_event": "heartbeat", "facts": {},
+     "allowed_tiers": ["fast_path"], "risk_requirements": []}
+  ]
+}

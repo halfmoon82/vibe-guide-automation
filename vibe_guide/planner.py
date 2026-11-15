@@ -29,6 +29,48 @@ class S0Result:
     rationale: str
 
 
+DURATIONS = ("session", "resume", "multiday")
+EXECUTION_TIERS = ("direct", "lean", "run")
+#: What every tier keeps: tiers change orchestration cost, never these.
+SAFEGUARDS = ("授权卡", "独立审查", "设计稿门", "真实授权")
+
+
+@dataclass(frozen=True)
+class OrchestrationFacts:
+    """Scale facts the entry can see before work starts; ``None`` is unknown.
+
+    ``nodes`` counts independently verifiable business nodes (not reviewers,
+    mechanical steps or an auto-added integration-review); ``parallel`` is the
+    wave's real startable capacity; ``coordination`` says cross-node
+    acceptance, multi-wave or in-flight-action recovery is really needed.
+    """
+
+    nodes: Optional[int] = None
+    parallel: Optional[int] = None
+    duration: Optional[str] = None
+    coordination: Optional[bool] = None
+    explicit_run: bool = False
+
+    def __post_init__(self):
+        for name in ("nodes", "parallel"):
+            value = getattr(self, name)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+                raise ValueError("{} must be a non-negative integer".format(name))
+        if self.duration is not None and self.duration not in DURATIONS:
+            raise ValueError("duration must be one of {}".format("/".join(DURATIONS)))
+        if self.coordination is not None and not isinstance(self.coordination, bool):
+            raise TypeError("coordination must be a boolean")
+
+
+@dataclass(frozen=True)
+class TierDecision:
+    tier: str
+    reason: str
+    unknown_facts: List[str] = field(default_factory=list)
+    contradiction: Optional[str] = None
+    safeguards: tuple = SAFEGUARDS
+
+
 @dataclass(frozen=True)
 class TaskContext:
     steps: int
@@ -42,6 +84,7 @@ class TaskContext:
     # spans sessions/interruptions.  None means "not assessed".
     parallel_nodes: Optional[int] = None
     cross_interrupt: Optional[bool] = None
+    orchestration: Optional[OrchestrationFacts] = None
 
     def __post_init__(self):
         if self.parallel_nodes is not None and (not isinstance(self.parallel_nodes, int) or isinstance(self.parallel_nodes, bool) or self.parallel_nodes < 0):
@@ -829,6 +872,9 @@ def parse_s1_context(value: Any) -> Optional[TaskContext]:
     head, *extras = [part.strip() for part in value.split(";")]
     parallel: Optional[int] = None
     interrupt: Optional[bool] = None
+    nodes: Optional[int] = None
+    duration: Optional[str] = None
+    coordination: Optional[bool] = None
     for extra in extras:
         key, _, raw = extra.partition("=")
         key, raw = key.strip().lower(), raw.strip().lower()
@@ -836,6 +882,12 @@ def parse_s1_context(value: Any) -> Optional[TaskContext]:
             parallel = int(raw)
         elif key == "resume" and raw in ("yes", "no"):
             interrupt = raw == "yes"
+        elif key == "nodes" and raw.isdigit():
+            nodes = int(raw)
+        elif key == "duration" and raw in DURATIONS:
+            duration = raw
+        elif key == "coordination" and raw in ("yes", "no"):
+            coordination = raw == "yes"
         else:
             return None
     try:
@@ -844,7 +896,49 @@ def parse_s1_context(value: Any) -> Optional[TaskContext]:
         return None
     if len(values) != 5 or any(item < 0 or item > 5 for item in values):
         return None
-    return TaskContext(*values, rationale={"source": "explicit"}, parallel_nodes=parallel, cross_interrupt=interrupt)
+    if duration is None and interrupt is not None:
+        duration = "resume" if interrupt else "session"
+    orchestration = None
+    if any(item is not None for item in (nodes, parallel, duration, coordination)):
+        orchestration = OrchestrationFacts(nodes, parallel, duration, coordination)
+    return TaskContext(*values, rationale={"source": "explicit"}, parallel_nodes=parallel, cross_interrupt=interrupt, orchestration=orchestration)
+
+
+def decide_execution_tier(score: int, facts: OrchestrationFacts) -> TierDecision:
+    """Difficulty profile plus orchestration benefit -> direct / lean / run.
+
+    The old 8/15 total only hints (<=8 usually direct); it never maps to a tier
+    by itself.  Unknown facts stay unknown: they cannot buy ``run``.  Risk,
+    authorization, GUI-gate and independent-review requirements are the same in
+    every tier (``SAFEGUARDS``).  Numeric thresholds are provisional until the
+    routing replay (tests/fixtures/v6_routing_replay) freezes them.
+    """
+    unknown = [name for name in ("nodes", "parallel", "duration", "coordination") if getattr(facts, name) is None]
+    nodes, parallel, duration = facts.nodes, facts.parallel, facts.duration
+    long_lived = duration in ("resume", "multiday")
+    contradiction = None
+    if score <= ROUTE_SIMPLE_MAX_SCORE and ((nodes or 0) >= 4 or duration == "multiday" or facts.coordination):
+        contradiction = "评分与规模矛盾：评分 {} 偏低，但规模事实（节点 {}、周期 {}）显示编排成本不低：先复核评分是否低估步骤或工具链".format(
+            score, nodes if nodes is not None else "未知", duration or "未知")
+
+    def decision(tier: str, reason: str) -> TierDecision:
+        full_reason = reason + "；" + contradiction if contradiction else reason
+        return TierDecision(tier, full_reason, unknown, contradiction)
+
+    if facts.explicit_run:
+        return decision("run", "产品经理显式要求完整流程；档位不授予执行权限")
+    if facts.coordination and nodes is not None and nodes >= 2 and long_lived:
+        return decision("run", "{} 个业务节点且跨会话，需要持久的跨节点验收/在途动作对账，小任务板不够".format(nodes))
+    if nodes is not None and nodes >= 5 and parallel is not None and parallel >= 3 and long_lived:
+        return decision("run", "{} 个业务节点、有效并行 {}、跨会话，多波协调收益明确".format(nodes, parallel))
+    if nodes == 1 and not long_lived:
+        return decision("direct", "单个节点、本会话可结束（评分 {}）：原会话完成，不为分数强拆".format(score))
+    if nodes is None and score <= ROUTE_SIMPLE_MAX_SCORE:
+        return decision("direct", "评分 {} 常对应直接执行，规模事实未知，先在原会话最小拆分".format(score))
+    if nodes == 1:
+        return decision("lean", "单个长串行节点：按轻监工持久续接，不为凑完整流程拆假节点")
+    return decision("lean", "有委派/独立审查收益但小任务板足以管理（节点 {}、并行 {}）".format(
+        nodes if nodes is not None else "未知", parallel if parallel is not None else "未知"))
 
 
 COMPLEX_MIN_PARALLEL_NODES = 3
