@@ -137,3 +137,50 @@ def preflight_with_checkpoint(paths, run_id, session_record, compute, *,
             return {**result, 'wakeup': {'turn_id': turn[1], 'phase': phase, 'reused': False}}
     except (OSError, ValueError, TimeoutError) as error:
         return {'state': 'unknown', 'reason': 'supervisor wakeup checkpoint unavailable: ' + str(error)[:200]}
+
+
+def should_wake(facts, watermark, *, now):
+    """Local pre-wake filter: does anything need a model judgment?
+
+    Inputs come from the mechanical layer before a heartbeat spends a model
+    call: event/delivery cursors, unresolved items, due actions, health and
+    contract digests, plus new vs already-diagnosed unknowns.  Nothing changed
+    stays silent; a new delivery wakes immediately.  Missing or garbled
+    watermarks/facts wake with an ``unknown`` reason rather than being read as
+    "nothing to do" -- the filter must never swallow a business item.
+    """
+    if not isinstance(facts, dict) or not isinstance(watermark, dict) or not watermark:
+        return {'wake': True, 'reasons': [
+            'facts_unknown' if not isinstance(facts, dict) else 'watermark_unknown'],
+            'next_check_at': None}
+    reasons = []
+    next_check_at = None
+    if facts.get('event_cursor') != watermark.get('event_cursor'):
+        reasons.append('new_event')
+    if facts.get('delivery_cursor') != watermark.get('delivery_cursor'):
+        reasons.append('new_delivery')
+    if facts.get('health_digest') != watermark.get('health_digest'):
+        reasons.append('health_changed')
+    if facts.get('contract_digest') != watermark.get('contract_digest'):
+        reasons.append('contract_changed')
+    served = watermark.get('served_unresolved')
+    served = served if isinstance(served, list) else []
+    for item in facts.get('unresolved') if isinstance(facts.get('unresolved'), list) else []:
+        if item not in served:
+            reasons.append('unresolved_unserved')
+            break
+    diagnosed = watermark.get('diagnosed_unknown')
+    diagnosed = diagnosed if isinstance(diagnosed, list) else []
+    for item in facts.get('new_unknown') if isinstance(facts.get('new_unknown'), list) else []:
+        if item not in diagnosed:
+            reasons.append('new_unknown')
+            break
+    for action in facts.get('due_actions') if isinstance(facts.get('due_actions'), list) else []:
+        if not isinstance(action, dict) or type(action.get('due_at')) not in (int, float):
+            continue
+        if action['due_at'] <= now:
+            reasons.append('action_due')
+            break
+        next_check_at = action['due_at'] if next_check_at is None else min(next_check_at, action['due_at'])
+    return {'wake': bool(reasons), 'reasons': sorted(set(reasons)),
+            'next_check_at': next_check_at}

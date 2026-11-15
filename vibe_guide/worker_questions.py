@@ -12,10 +12,12 @@ next generation's prompt when ``vibe requeue --note`` re-dispatches the node.
 """
 
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional
 
+from . import context_projection
 from .decision_boundary import ScopedDecisionMailbox
 from .fsio import JsonCorruptError, JsonMissingError, atomic_write_json, read_json
 from .paths import ProjectPaths
@@ -286,6 +288,13 @@ def _run_answered_decisions_section(contract: Dict[str, Any]) -> str:
     run_scoped = [item for item in answered if item["scope"] == "run"]
     if not run_scoped:
         return ""
+    # Continuation diff: decisions the worker already received are not resent.
+    # A missing/garbled watermark resends them all (safe minimal contract).
+    run_scoped = context_projection.delta_since(
+        [dict(item, id=item["decision_id"]) for item in run_scoped],
+        delivered_ids=contract.get("delivered_decision_ids"))["items"]
+    if not run_scoped:
+        return ""
     lines = ["本 run 已答决策（scope=run）："]
     for item in run_scoped:
         lines.append("- {}「{}」→ 结论：{}（来源：节点 {}）".format(
@@ -324,3 +333,24 @@ def render_status_lines(paths: Optional[ProjectPaths], snapshot: Any) -> str:
         "需要监工答复：节点 {} 的{}「{}」（全文 {}）".format(
             item["node_id"], _label(item), item.get("excerpt") or "", item.get("file"))
         for item in questions)
+
+
+def continuation_package(items: List[Dict[str, Any]], *, delivered_ids: Any,
+                         role: str, node_id: str) -> Dict[str, Any]:
+    """Diff material (findings, decisions) for the next generation of a node.
+
+    Only what the worker has not been given is sent; resolved findings shrink
+    to result + source.  A lost or unusable delivery watermark sends the full
+    relevant set instead (a safe minimal contract), with the reason.  The soft
+    budget is reported, never enforced by dropping material.
+    """
+    delta = context_projection.delta_since(items, delivered_ids=delivered_ids)
+    projected = context_projection.project_or_full(
+        lambda: context_projection.project_findings(delta["items"])["findings"],
+        lambda: list(delta["items"]))
+    sections = {"{}:{}".format(role, node_id): json.dumps(
+        projected["value"], ensure_ascii=False, sort_keys=True)}
+    return {"items": projected["value"],
+            "fallback": delta["fallback"] or projected["fallback"],
+            "reason": delta["reason"] or projected["reason"],
+            "budget": context_projection.budget_report(sections)}
