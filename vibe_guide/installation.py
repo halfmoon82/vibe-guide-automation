@@ -203,11 +203,22 @@ class InstallStateMachine:
 
 
 def run_install(request: InstallRequest, paths: Any, capability_authorizer: Any = None, probe: Any = None) -> InstallResult:
-    return _run(request, paths, capability_authorizer, probe, False)
+    return _run(request, paths, capability_authorizer, _default_probe(probe), False)
 
 
 def run_upgrade(request: InstallRequest, paths: Any, capability_authorizer: Any = None, probe: Any = None) -> InstallResult:
-    return _run(request, paths, capability_authorizer, probe, True)
+    return _run(request, paths, capability_authorizer, _default_probe(probe), True)
+
+
+def _default_probe(probe: Any) -> Any:
+    """Real default probe (P2a): detect Ollama instead of returning an empty
+    ``verified``.  An absent Ollama records ``local_model.status`` truthfully
+    while the install itself still completes — degraded mode is a product
+    decision (decision A), not an install blocker."""
+    if probe is not None:
+        return probe
+    from . import local_model  # late import keeps the helper optional
+    return local_model.install_probe
 
 
 __all__ = ["InstallRequest", "InstallResult", "InstallStateMachine", "PHASES", "run_install", "run_upgrade"]
