@@ -42,11 +42,13 @@ commands.
 import json
 import re
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from .digests import canonical_json_digest
 from .models import INTEGRATION_REVIEW_NODE_ID, REMOTE_DELIVERY_NODE_ID
+from .review_claim import active_claim_holder
 
 REMOTE_DELIVERY_STEPS: Sequence[str] = (
     "prepare",
@@ -73,6 +75,12 @@ REMOTE_DELIVERY_AUDIT_EVENTS = frozenset({
 })
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+# vibe 自身的占位标识前缀：只有他人的有效占位会挡住自动交付合并。
+OWN_CLAIM_PREFIX = "vibe-"
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 
 DEFAULT_TARGET_BRANCH = "main"
@@ -732,7 +740,7 @@ class SubprocessRemoteDeliveryExecutor(RemoteDeliveryExecutor):
         if not pr_url.startswith("http"):
             raise RemoteDeliveryFailed("merge", "PR URL is missing", retryable=False)
         view = _run_gh(
-            repo, ["pr", "view", pr_url, "--json", "state,headRefOid,mergeCommit"], timeout=timeout
+            repo, ["pr", "view", pr_url, "--json", "state,headRefOid,mergeCommit,comments"], timeout=timeout
         )
         try:
             payload = json.loads(view)
@@ -767,7 +775,16 @@ class SubprocessRemoteDeliveryExecutor(RemoteDeliveryExecutor):
             raise RemoteDeliveryFailed(
                 "merge", "PR head moved after review; delivery must re-verify", retryable=True
             )
-        output = _run_gh(repo, ["pr", "merge", pr_url, "--squash"], timeout=timeout)
+        # 审阅占位（2026-11-19）：他人正在审时不合并，按可重试失败等占位释放或过期。
+        holder = active_claim_holder(payload.get("comments") or [], _utcnow())
+        if holder and not holder.startswith(OWN_CLAIM_PREFIX):
+            raise RemoteDeliveryFailed(
+                "merge", "PR is under review claim by {}; merge deferred until released".format(holder), retryable=True
+            )
+        merge_args = ["pr", "merge", pr_url, "--squash"]
+        if _SHA_RE.match(head_sha):
+            merge_args += ["--match-head-commit", head_sha]
+        output = _run_gh(repo, merge_args, timeout=timeout)
         match = re.search(r"\b([0-9a-f]{40})\b", output)
         merge_commit = match.group(1) if match else ""
         if not merge_commit:
