@@ -12,7 +12,7 @@ from typing import Any, Iterable, Optional
 
 DEFAULT_TTL_SECONDS = 3 * 3600
 _MARK = re.compile(r"<!-- review-claim:v1 (\{[^\n]*?\}) -->")
-_HOLDER = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+_HOLDER = re.compile(r"[A-Za-z0-9._:-]{1,64}")
 
 
 def _parse_time(value: Any) -> Optional[float]:
@@ -36,7 +36,7 @@ def active_claim_holder(comments: Iterable[Any], now: datetime, ttl_seconds: int
         except ValueError:
             continue
         holder = data.get("holder") if isinstance(data, dict) else None
-        if isinstance(holder, str) and _HOLDER.match(holder):
+        if isinstance(holder, str) and _HOLDER.fullmatch(holder):
             rows.append((at, holder, data.get("state")))
     holders = {}
     for at, holder, state in sorted(rows, key=lambda row: row[0]):
@@ -47,7 +47,9 @@ def active_claim_holder(comments: Iterable[Any], now: datetime, ttl_seconds: int
         else:
             holders.pop(holder, None)
     current = now.timestamp()
+    # 只按起点排序（稳定排序 + dict 保留插入顺序）：同一秒时先出现的评论获胜，与控制面一致。
     live = sorted(
         ((info["since"], holder) for holder, info in holders.items() if current - info["last"] < ttl_seconds),
+        key=lambda item: item[0],
     )
     return live[0][1] if live else None

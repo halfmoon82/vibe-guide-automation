@@ -8,7 +8,7 @@
 - **四类例外按对抗场景审**：本 PR 改到处理外部不可信输入、多租户、真实资金、个人隐私/凭据的代码路径时，考虑恶意输入、越权和伪造，但只防外部一方（公网请求者、第三方回调、其他租户、上传者、资金往来的外部方）。
 - **其余一律 P3，不拦合并**（罕见边界、只在人为构造或四类例外外的对抗场景出现、旧代码问题、测试卫生、可读性建议），但须登记在 PR 描述的“已知后续”。必然变红的测试按 P1 拦；必须有的回归测试缺失按所修缺陷的级别定级；重试、并发、进程中途退出算正常使用；拿不准时按最现实场景定级，举不出现实场景的定 P3。复审以核对上一轮修复为主，但满足三条件的问题不论哪一轮发现都拦。
 - **审阅占位（同一 PR 同时只许一方审阅与合并）**：审阅前先执行 `node /Volumes/Storage/auto调度/scripts/review-claim.mjs claim --pr <PR号> --repo halfmoon82/vibe-guide-automation --holder <平台>-<会话或触发ID>`（标识仅 ASCII 字母数字与 `._:-`，每个会话唯一，如 `codex-9f94e800`、`workbuddy-<任务ID>`）；退出码 3 表示他人正在审，立即停止，不审、不派 reviewer、不合并。合并只能用 `node /Volumes/Storage/auto调度/scripts/review-claim.mjs merge --pr <PR号> --repo halfmoon82/vibe-guide-automation --holder <同一标识> --head <审过的完整提交> [--delete-branch]`，不得直接 `gh pr merge`（非持有者、审后有新提交、CI 未跑完或失败都会被拒）。返工复审用同一标识重新 claim 即续期；占位 3 小时未续期视为放弃，他人可接手；放弃审阅用 `node /Volumes/Storage/auto调度/scripts/review-claim.mjs release --pr <PR号> --repo halfmoon82/vibe-guide-automation --holder <同一标识>`。CI 未跑完时 merge 会被拒，等 CI 跑完再 merge，不算失败。
-- 会话内或手工合并必须走上面的占位与 review-claim merge。vibe 内置的自动交付合并（`vibe_guide/remote_delivery.py` 的 merge 步骤）已接入占位：合并前读取 PR 占位，他人（标识不以 `vibe-` 开头）持有有效占位时暂缓合并、按可重试失败等待释放或过期，并用 `--match-head-commit` 锁定审过的提交（读取逻辑见 `vibe_guide/review_claim.py`，与控制面同格式）。
+- 会话内或手工合并必须走上面的占位与 review-claim merge。vibe 内置的自动交付合并（`vibe_guide/remote_delivery.py` 的 merge 步骤）已接入占位：合并前读取 PR 占位，任何有效占位（vibe 自身从不写占位）都暂缓合并、按可重试失败等待释放或过期，并用 `--match-head-commit` 锁定审过的提交（读取逻辑见 `vibe_guide/review_claim.py`，与控制面同格式）。
 - Git 红线（禁止 `git add .`/`-A`；未经授权不 push / merge / deploy；版本交付规则）见 §10，本节不放宽。
 
 ## 1. 项目目标与边界

@@ -48,6 +48,18 @@ class ActiveClaimHolderTests(unittest.TestCase):
         ]
         self.assertEqual(active_claim_holder(comments, NOW), "claude-b")
 
+    def test_same_second_tie_goes_to_first_comment(self):
+        at = iso(NOW - timedelta(minutes=1))
+        comments = [
+            {"body": js_marker("workbuddy-x", "aaa1111", "active"), "createdAt": at},
+            {"body": js_marker("claude-a", "aaa1111", "active"), "createdAt": at},
+        ]
+        self.assertEqual(active_claim_holder(comments, NOW), "workbuddy-x")
+
+    def test_holder_with_trailing_newline_is_rejected(self):
+        body = '<!-- review-claim:v1 {"holder":"codex-a\\n","head":"aaa1111","state":"active"} -->'
+        self.assertIsNone(active_claim_holder([{"body": body, "createdAt": iso(NOW)}], NOW))
+
     def test_plain_text_is_not_a_claim(self):
         comments = [{"body": "review-claim holder=evil", "createdAt": iso(NOW)}]
         self.assertIsNone(active_claim_holder(comments, NOW))
@@ -94,8 +106,13 @@ class DeliveryMergeClaimTests(unittest.TestCase):
                 executor.execute("merge", {"pr_url": PR_URL, "head_sha": H1})
         self.assertEqual(merged, [])
 
-    def test_unclaimed_or_own_claim_merges_locked_to_reviewed_head(self):
-        for comments in ([], [{"body": js_marker("vibe-plan-1", H1, "active"), "createdAt": iso(NOW - timedelta(minutes=5))}]):
+    def test_any_claim_blocks_even_vibe_prefixed(self):
+        comments = [{"body": js_marker("vibe-plan-1", H1, "active"), "createdAt": iso(NOW - timedelta(minutes=5))}]
+        with self.assertRaises(RemoteDeliveryFailed):
+            self._run(comments)
+
+    def test_unclaimed_merges_locked_to_reviewed_head(self):
+        for comments in ([],):
             result, calls = self._run(comments)
             self.assertEqual(result["merge_commit"], H2)
             merge = [c for c in calls if c[:2] == ["pr", "merge"]][0]

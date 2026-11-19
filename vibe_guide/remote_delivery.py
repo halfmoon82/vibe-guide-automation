@@ -75,12 +75,6 @@ REMOTE_DELIVERY_AUDIT_EVENTS = frozenset({
 })
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-# vibe 自身的占位标识前缀：只有他人的有效占位会挡住自动交付合并。
-OWN_CLAIM_PREFIX = "vibe-"
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 
 DEFAULT_TARGET_BRANCH = "main"
@@ -93,6 +87,10 @@ _EVENT_DATA_WHITELIST = (
     "source_branch", "target_branch", "remote_verification", "retryable",
     "delivery",
 )
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _snapshot_value(snapshot: Any, key: str, default: Any = None) -> Any:
@@ -775,9 +773,10 @@ class SubprocessRemoteDeliveryExecutor(RemoteDeliveryExecutor):
             raise RemoteDeliveryFailed(
                 "merge", "PR head moved after review; delivery must re-verify", retryable=True
             )
-        # 审阅占位（2026-11-19）：他人正在审时不合并，按可重试失败等占位释放或过期。
+        # 审阅占位（2026-11-19）：vibe 自身不写占位，任何有效占位都表示有人正在审，
+        # 不合并，按可重试失败等占位释放或过期。
         holder = active_claim_holder(payload.get("comments") or [], _utcnow())
-        if holder and not holder.startswith(OWN_CLAIM_PREFIX):
+        if holder:
             raise RemoteDeliveryFailed(
                 "merge", "PR is under review claim by {}; merge deferred until released".format(holder), retryable=True
             )
