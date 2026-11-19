@@ -1,5 +1,15 @@
 # Vibe Coding 辅助开发向导
 
+## 审阅与合并门禁（所有宿主通用：Codex / Claude Code / WorkBuddy / Hub 规则）
+
+> 2026-11-19 用户定，与控制面 multiagent-autoloop 的 `docs/review-severity.md` 同口径。放在文件开头，避免 WorkBuddy 只读前 8000 字时漏掉。
+
+- **拦截三条件，同时满足才算 P0–P2**：①会真实发生——worker、作者 Agent、同一系统用户一律按合作方，不按攻击者；②是本 PR 引入或让其变得可触发的，未改动的旧代码问题不算；③后果够级：P0 真实丢钱/丢数据/持久化数据写错/泄露隐私或凭据，P1 主流程坏或计算/展示结果错或事务留下不一致，P2 常见场景下的行为回归或明显错误。
+- **四类例外按对抗场景审**：本 PR 改到处理外部不可信输入、多租户、真实资金、个人隐私/凭据的代码路径时，考虑恶意输入、越权和伪造，但只防外部一方（公网请求者、第三方回调、其他租户、上传者）。
+- **其余一律 P3，不拦合并**（罕见边界、只在人为构造或四类例外外的对抗场景出现、旧代码问题、测试卫生、可读性建议），但须登记在 PR 描述的“已知后续”。必然变红的测试按 P1 拦；必须有的回归测试缺失按所修缺陷的级别定级；重试、并发、进程中途退出算正常使用；拿不准时按最现实场景定级，举不出现实场景的定 P3。复审以核对上一轮修复为主，但满足三条件的问题不论哪一轮发现都拦。
+- **审阅占位（同一 PR 同时只许一方审阅与合并）**：审阅前先执行 `node /Volumes/Storage/auto调度/scripts/review-claim.mjs claim --pr <PR号> --repo halfmoon82/vibe-guide-automation --holder <平台>-<会话或触发ID>`（标识仅 ASCII 字母数字与 `._:-`，每个会话唯一，如 `codex-9f94e800`、`workbuddy-<任务ID>`）；退出码 3 表示他人正在审，立即停止，不审、不派 reviewer、不合并。合并只能用 `node /Volumes/Storage/auto调度/scripts/review-claim.mjs merge --pr <PR号> --repo halfmoon82/vibe-guide-automation --holder <同一标识> --head <审过的完整提交> [--delete-branch]`，不得直接 `gh pr merge`（非持有者、审后有新提交、CI 未跑完或失败都会被拒）。返工复审用同一标识重新 claim 即续期；放弃审阅用 `release`。
+- 本节与下文监工授权卡里“P0-P2 清零后受限 merge”的规定叠加：监工自动合并同样必须先占位、用 review-claim merge 合并。
+
 ## 1. 项目目标与边界
 
 本项目提供一个通用的辅助开发向导：
