@@ -526,11 +526,46 @@ class AutomationSpecTests(unittest.TestCase):
             validate_automation_spec(dict(self.CRON, target_thread_id="t-1"))[0]
         )
 
+    def test_cron_target_must_be_a_project(self):
+        for target in (None, {}, {"type": "project"}, {"type": "project", "project_id": " "},
+                       {"type": "thread", "project_id": "p-1"}, "p-1"):
+            spec = {k: v for k, v in self.CRON.items() if k != "target"}
+            if target is not None:
+                spec["target"] = target
+            self.assertFalse(validate_automation_spec(spec)[0], target)
+
+    def test_require_purpose_rejects_omission(self):
+        self.assertFalse(validate_automation_spec(self.HB, require_purpose=True)[0])
+        self.assertFalse(validate_automation_spec(self.CRON, require_purpose=True)[0])
+        self.assertTrue(validate_automation_spec(
+            dict(self.CRON, purpose="independent_cron"), require_purpose=True)[0])
+
+    def test_cron_trigger_must_match_project(self):
+        cron = dict(self.CRON)
+        self.assertFalse(verify_automation_readback(cron, dict(cron), {"kind": "cron"})[0])
+        self.assertFalse(verify_automation_readback(
+            cron, dict(cron), {"kind": "cron", "project_id": "other"})[0])
+
+    def test_readback_gaps(self):
+        fired = {"kind": "heartbeat", "thread_id": "t-1"}
+        # every compared field is checked, including the schedule and project target
+        for field, value in (("rrule", "FREQ=MINUTELY;INTERVAL=5"), ("kind", "cron"),
+                             ("target", {"type": "project", "project_id": "p-1"})):
+            self.assertFalse(verify_automation_readback(
+                self.HB, dict(self.HB, **{field: value}), fired)[0], field)
+        cron_fired = {"kind": "cron", "project_id": "p-1"}
+        self.assertFalse(verify_automation_readback(
+            self.CRON, dict(self.CRON, target={"type": "project", "project_id": "p-2"}), cron_fired)[0])
+        self.assertFalse(verify_automation_readback(
+            self.CRON, dict(self.CRON, rrule="FREQ=DAILY;BYHOUR=1"), cron_fired)[0])
+        self.assertFalse(verify_automation_readback(self.HB, "bad", fired)[0])
+
     def test_matching_readback_is_accepted(self):
         fired = {"kind": "heartbeat", "thread_id": "t-1"}
         self.assertTrue(verify_automation_readback(self.HB, dict(self.HB), fired)[0])
         self.assertTrue(
-            verify_automation_readback(self.CRON, dict(self.CRON), {"kind": "cron"})[0]
+            verify_automation_readback(
+                self.CRON, dict(self.CRON), {"kind": "cron", "project_id": "p-1"})[0]
         )
 
     def test_readback_mismatch_is_rejected(self):

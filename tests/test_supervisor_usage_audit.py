@@ -1,5 +1,7 @@
 import importlib.util
 import json
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -100,6 +102,22 @@ class UsageAuditTests(unittest.TestCase):
             self.assertEqual(nodes['n3']['status'], 'unknown')
             self.assertIsNone(nodes['n3']['total_uncached_input_output_tokens'])
             self.assertEqual(audit.build_report(registry, [Path(root)])['nodes'], {})
+
+    @unittest.skipUnless(shutil.which('zstd'), 'zstd CLI unavailable')
+    def test_zst_log_is_read_like_plain_jsonl(self):
+        with tempfile.TemporaryDirectory() as root:
+            t = {'input_tokens': 100, 'cached_input_tokens': 80, 'output_tokens': 20}
+            plain = self.log(root, 'rollout-z1.jsonl', 'z1', [t])
+            subprocess.run(['zstd', '-q', '--rm', str(plain)], check=True)
+            report = audit.build_report({'current': {'session_id': 'z1', 'node_id': 'n1'}}, [Path(root)])
+            self.assertEqual(report['nodes']['n1']['total_uncached_input_output_tokens'], 40)
+
+    def test_corrupt_zst_log_is_unknown_not_zero(self):
+        with tempfile.TemporaryDirectory() as root:
+            (Path(root) / 'rollout-z2.jsonl.zst').write_bytes(b'not zstd data')
+            report = audit.build_report({'current': {'session_id': 'z2', 'node_id': 'n1'}}, [Path(root)])
+            self.assertIsNone(report['nodes']['n1']['total_uncached_input_output_tokens'])
+            self.assertEqual(report['nodes']['n1']['status'], 'unknown')
 
 
 if __name__ == '__main__':
